@@ -15,8 +15,9 @@ Phrase API data (workflow steps, MT engine, created jobs) when the
 import os
 from typing import Any, Optional
 
-import httpx
-
+# NOTE: IO-gerelateerde imports (httpx) en env-reads moeten BINNEN activities
+# blijven: de Temporal workflow-sandbox blokkeert module-level imports van
+# urllib-ketens.
 import mistralai.workflows as workflows
 from mistralai.workflows import Depends
 from mistralai.workflows.plugins.mistralai.connectors import (
@@ -28,16 +29,17 @@ from mistralai.workflows.plugins.triggers import TriggerEvent
 
 teams_connector = connector("teams")
 
-TEAM_ID = os.environ.get("TEAMS_TEAM_ID", "60f99958-3d93-415c-a2ff-7e62f5da25a2")
-CHANNEL_ID = os.environ.get(
-    "TEAMS_CHANNEL_ID", "19:f12365030ece4194a88701a4efcb7b0b@thread.tacv2"
-)
-PHRASE_API_BASE = os.environ.get(
-    "PHRASE_API_BASE", "https://api.phrase.com"
-).rstrip("/")
-PHRASE_API_TOKEN = os.environ.get("PHRASE_API_TOKEN", "")
-
 SUPPORTED_EVENTS = {"PROJECT_CREATED", "JOB_CREATED", "JOB_STATUS_CHANGED"}
+
+
+def _team_id() -> str:
+    return os.environ.get("TEAMS_TEAM_ID", "60f99958-3d93-415c-a2ff-7e62f5da25a2")
+
+
+def _channel_id() -> str:
+    return os.environ.get(
+        "TEAMS_CHANNEL_ID", "19:f12365030ece4194a88701a4efcb7b0b@thread.tacv2"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -161,13 +163,19 @@ async def extract_event(event: TriggerEvent) -> dict:
 @workflows.activity(name="enrich-project-details")
 async def enrich_project_details(payload: dict) -> dict:
     """Fetch live project details (workflow steps, MT settings, jobs) from Phrase."""
-    if not PHRASE_API_TOKEN:
+    import httpx  # binnen de activity: activities draaien buiten de workflow-sandbox
+
+    api_base = os.environ.get(
+        "PHRASE_API_BASE", "https://api.phrase.com/api2"
+    ).rstrip("/")
+    token = os.environ.get("PHRASE_API_TOKEN", "")
+    if not token:
         return {}
     project = payload.get("project") or {}
     uid = project.get("uid")
     if not uid:
         return {}
-    headers = {"Authorization": f"ApiToken {PHRASE_API_TOKEN}", "Accept": "application/json"}
+    headers = {"Authorization": f"ApiToken {token}", "Accept": "application/json"}
     details: dict = {}
     async with httpx.AsyncClient(timeout=30) as http:
         for key, path in {
@@ -176,7 +184,7 @@ async def enrich_project_details(payload: dict) -> dict:
             "mtSettings": f"/api2/v1/projects/{uid}/mtSettings",
         }.items():
             try:
-                resp = await http.get(PHRASE_API_BASE + path, headers=headers)
+                resp = await http.get(api_base + path, headers=headers)
                 resp.raise_for_status()
                 details[key] = resp.json()
             except Exception:
@@ -185,7 +193,7 @@ async def enrich_project_details(payload: dict) -> dict:
         for level in (1, 2, 3, 4):
             try:
                 resp = await http.get(
-                    f"{PHRASE_API_BASE}/api2/v2/projects/{uid}/jobs",
+                    f"{api_base}/api2/v2/projects/{uid}/jobs",
                     headers=headers,
                     params={"pageSize": 50, "workflowLevel": level},
                 )
@@ -210,8 +218,8 @@ async def post_to_teams(
     resp = await teams.call_tool(
         tool_name="teams_post_channel_message",
         arguments={
-            "team_id": TEAM_ID,
-            "channel_id": CHANNEL_ID,
+            "team_id": _team_id(),
+            "channel_id": _channel_id(),
             "subject": message["subject"],
             "content": message["content"],
         },
