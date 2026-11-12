@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "phrase-teams-worker"
+version = "0.1.0"
+description = "Mistral Workflows worker: Phrase TMS events -> Teams channel 'Phrase updates'"
+requires-python = ">=3.11"
+dependencies = [
+    "mistralai-workflows>=3.10",
+    "mistralai-workflows-plugins-mistralai",
+    "mistralai-workflows-plugins-triggers",
+    "pydantic>=2",
+    "httpx",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/worker"]
