@@ -1,8 +1,6 @@
-import pytest
-
 from worker.workflows.phrase_qa_voorvertaling import (
-    EN_GB_PAIRS,
     apply_fixes,
+    extract_preferred_terms,
     is_relevant_event,
 )
 
@@ -31,4 +29,12 @@ def test_no_false_positive():
 
 
 def test_term_correction():
-    fixed, reasons = apply_fixes("Contact the helpdesk today.", [{"terms": ["help desk"]}], "en_gb")
+    fixed, reasons = apply_fixes("He works in the organisation.", ["organization"], "en_gb")
+    assert "organization" in fixed
+    assert reasons
+
+
+def test_extract_preferred_terms():
+    assert extract_preferred_terms(["help desk"]) == ["help desk"]
+    assert extract_preferred_terms([{"terms": [{"term": "help desk", "language": "en"}]}]) == ["help desk"]
+    assert extract_preferred_terms([]) == []

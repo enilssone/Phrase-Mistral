@@ -1,16 +1,16 @@
 """Realtime kwaliteitscheck direct na Phrase-voorvertaling (Taalcentrum-VU).
 
-Getriggerd door de Mistral-webhook (Phrase Orchestrator event-webhook) bij
+Getriggerd door de Mistral-webhook (Phrase event-webhook) bij
 JOB_STATUS_CHANGED / COMPLETED op workflow level 1 (voorvertaling PLAI /
 MT-profiel). Voert uit, zodra het project een contentgroep EN termbase heeft:
 
-1. Terminologie uit de gekoppelde termbase toetsen op de targets.
-2. Contentgroep-stijlregels (o.a. en-GB-conversie; UT-regels) toetsen.
+1. Terminologie uit de gekoppelde termbase(s) toetsen op de targets.
+2. Contentgroep-stijlregels toetsen (o.a. UT-regels; en-GB-conversie).
 3. Correcties terugschrijven naar Phrase (bilingual-file flow,
    saveToTransMemory=Confirmed, geen setCompleted, geen AIU's).
 4. Excel-overzicht van wijzigingen -> SharePoint-map "Mistral QA voorvertaling"
    (Vertalen intern > Phrase).
-5. Teams-melding in het kanaal "Phrase updates" (chat-target via env).
+5. Teams-melding in het kanaal "Phrase updates".
 
 Alle Phrase-calls zijn gewone REST-calls met PHRASE_API_TOKEN (0 AIU's).
 """
@@ -50,13 +50,20 @@ def _api_base() -> str:
     return os.environ.get("PHRASE_API_BASE", "https://api.phrase.com/api2").rstrip("/")
 
 
+def _auth() -> dict:
+    return {
+        "Authorization": f"ApiToken {os.environ['PHRASE_API_TOKEN']}",
+        "Accept": "application/json",
+    }
+
+
 def is_relevant_event(payload: dict) -> bool:
     """COMPLETED-voorvertalingen op workflow level 1."""
     if payload.get("event") != "JOB_STATUS_CHANGED":
         return False
     parts = payload.get("jobParts") or []
     return any(
-        (p.get("status") == "COMPLETED") and int(p.get("workflowLevel") or 1) == 1
+        p.get("status") == "COMPLETED" and int(p.get("workflowLevel") or 1) == 1
         for p in parts
     )
 
@@ -66,7 +73,7 @@ def is_relevant_event(payload: dict) -> bool:
 # --------------------------------------------------------------------------
 
 # en-GB conversie: (Amerikaans, Brits). Alleen veilige, eenduidige gevallen.
-EN_GB_PAIRS = [
+EN_GB_PAIRS: list[tuple[str, str]] = [
     ("organize", "organise"), ("organized", "organised"), ("organizing", "organising"),
     ("organization", "organisation"), ("organizations", "organisations"),
     ("recognize", "recognise"), ("realize", "realise"), ("realization", "realisation"),
@@ -75,61 +82,78 @@ EN_GB_PAIRS = [
     ("behavior", "behaviour"), ("favor", "favour"), ("honor", "honour"),
     ("neighbor", "neighbour"), ("labor", "labour"),
     ("center", "centre"), ("centers", "centres"), ("theater", "theatre"),
-    ("liter", "litre"), ("meter", "metre"), ("fiber", "fibre"),
-    ("traveled", "travelled"), "traveling", ("labeled", "labelled"),
+    ("liter", "litre"), ("fiber", "fibre"),
+    ("traveled", "travelled"), ("traveling", "travelling"), ("labeled", "labelled"),
     ("counseling", "counselling"), ("enrollment", "enrolment"),
     ("defense", "defence"), ("offense", "offence"), ("pretense", "pretence"),
-    ("fulfill", "fulfil"), ("fulfillment", "fulfilment"), ("gray", "grey"),
-    ("aluminum", "aluminium"), ("jewelry", "jewellery"),
+    ("fulfill", "fulfil"), ("fulfillment", "fulfilment"),
+    ("gray", "grey"), ("aluminum", "aluminium"), ("jewelry", "jewellery"),
 ]
-EN_GB_PAIRS = [p if isinstance(p, tuple) else (p, None) for p in EN_GB_PAIRS]
-EN_GB_PAIRS = [(a, b) for a, b in EN_GB_PAIRS if b]
 
-# UT-regels die toetsbaar zijn op zinsniveau.
-UT_RULES = {
-    "no_article_before_ut": re.compile(r"\bthe (UT)\b", re.IGNORECASE),
-    "apostrophe_plurals": re.compile(r"\b(\d{4})'s\b"),
-    "abbreviation_full_stops": re.compile(r"\b(U\.T\.|Ph\.D\.)\b"),
-}
+# UT-regels die op zinsniveau toetsbaar zijn.
+UT_RE_THE_UT = re.compile(r"\bthe UT\b", re.IGNORECASE)
+UT_RE_APOSTROPHE_PLURAL = re.compile(r"\b(\d{4})'s\b")
+UT_RE_ABBR_DOTS = re.compile(r"\b(U\.T\.|Ph\.D\.)\b")
 
 
-def apply_fixes(text: str, terms: list, target_lang: str) -> tuple[str, list[str]]:
+def _is_en_gb(target_lang: str) -> bool:
+    return "en_gb" in (target_lang or "").lower() or (target_lang or "").lower() == "en-gb"
+
+
+def extract_preferred_terms(terms: list) -> list[str]:
+    """Haalt de voorkeurstermen (target-zijde) uit een termbase-response."""
+    preferred: list[str] = []
+    for entry in terms or []:
+        if isinstance(entry, str):
+            preferred.append(entry)
+            continue
+        if not isinstance(entry, dict):
+            continue
+        items = entry.get("terms") or []
+        if items and isinstance(items[0], str):
+            preferred.append(items[0])
+            continue
+        for t in items:
+            if isinstance(t, dict) and t.get("term"):
+                # Voorkeur: eerste term in de doeltaan van de entry.
+                preferred.append(t["term"])
+                break
+    return [t for t in preferred if t]
+
+
+def apply_fixes(text: str, preferred_terms: list[str], target_lang: str) -> tuple[str, list[str]]:
     """Past termbase-termen, en-GB-conversie en UT-regels toe."""
     reasons: list[str] = []
     out = text
 
-    # 1. Termbase-termen (case-insensitive, woordgrenzen).
-    for term in terms:
-        src = (term.get("terms") or {})[0] if isinstance(term, dict) else None
-        if not src:
-            continue
-        pattern = re.compile(r"\b" + re.escape(src) + r"\b", re.IGNORECASE)
-        if pattern.search(out):
-            out = pattern.sub(src, out)
-            reasons.append(f"terminologie: {src}")
+    for term in preferred_terms:
+        pattern = re.compile(r"\b" + re.escape(term) + r"\b", re.IGNORECASE)
+        m = pattern.search(out)
+        if m and m.group(0) != term:
+            out = pattern.sub(term, out)
+            reasons.append(f"terminologie: '{m.group(0)}' -> '{term}'")
 
-    # 2. en-GB-conversie (alleen doeltaal en-GB / en_gb).
-    if "en_gb" in (target_lang or "").lower() or target_lang == "en_gb":
+    if _is_en_gb(target_lang):
         for us, gb in EN_GB_PAIRS:
             pattern = re.compile(r"\b" + us + r"\b", re.IGNORECASE)
-            if pattern.search(out):
-                out = pattern.sub(lambda m, gb=gb: gb if m.group(0).islower() else gb.capitalize(), out)
-                reasons.append(f"en-GB: {us} -> {gb}")
+            m = pattern.search(out)
+            if m:
+                repl = gb if m.group(0).islower() else gb.capitalize()
+                out = pattern.sub(repl, out)
+                reasons.append(f"en-GB: '{us}' -> '{gb}'")
 
-    # 3. UT-regels.
-    m = UT_RULES["no_article_before_ut"].search(out)
-    if m:
-        out = UT_RULES["no_article_before_ut"].sub(r"UT", out)
+    if UT_RE_THE_UT.search(out):
+        out = UT_RE_THE_UT.sub("UT", out)
         reasons.append("UT-regel: geen lidwoord voor UT")
-    m = UT_RULES["apostrophe_plurals"].search(out)
+    m = UT_RE_APOSTROPHE_PLURAL.search(out)
     if m:
-        out = UT_RULES["apostrophe_plurals"].sub(r"\1s", out)
+        out = UT_RE_APOSTROPHE_PLURAL.sub(r"\1s", out)
         reasons.append("apostrof in meervoud")
-    m = UT_RULES["abbreviation_full_stops"].search(out)
+    m = UT_RE_ABBR_DOTS.search(out)
     if m:
         fixed = m.group(1).replace(".", "")
-        out = UT_RULES["abbreviation_full_stops"].sub(fixed, out)
-        reasons.append("afkorting zonder punten")
+        out = UT_RE_ABBR_DOTS.sub(fixed, out)
+        reasons.append(f"afkorting zonder punten: '{m.group(1)}' -> '{fixed}'")
     return out, reasons
 
 
@@ -152,100 +176,112 @@ async def qa_fetch_project_info(payload: dict) -> dict:
     project_uid = project.get("uid")
     if not project_uid:
         return {"check": False, "reason": "geen project-uid"}
+
     async with httpx.AsyncClient(timeout=60) as http:
-        r = await http.get(
-            f"{_api_base()}/api2/v2/projects/{project_uid}", headers={"Authorization": f"ApiToken {os.environ['PHRASE_API_TOKEN']}", "Accept": "application/json"}
-        )
+        r = await http.get(f"{_api_base()}/api2/v2/projects/{project_uid}", headers=_auth())
         r.raise_for_status()
         details = r.json()
 
         r = await http.get(
-            f"{_api_base()}/api2/v1/projects/{project_uid}/termBases", headers={"Authorization": f"ApiToken {os.environ['PHRASE_API_TOKEN']}"}
+            f"{_api_base()}/api2/v1/projects/{project_uid}/termBases", headers=_auth()
         )
         term_bases = r.json().get("termBases", []) if r.status_code == 200 else []
 
         r = await http.get(
-            f"{_api_base()}/api2/v1/projects/{project_uid}/contentGroups", headers={"Authorization": f"ApiToken {os.environ['PHRASE_API_TOKEN']}"}
+            f"{_api_base()}/api2/v1/projects/{project_uid}/contentGroups", headers=_auth()
         )
         content_groups = r.json().get("contentGroups", []) if r.status_code == 200 else []
 
-    terms = []
-    async with None.__class__.__mro__ and __import__("httpx").AsyncClient(timeout=60) as http:
+        raw_terms: list = []
         for tb in term_bases:
-            uid = tb.get("id") or tb.get("uid")
+            tb_uid = tb.get("id") or tb.get("uid")
+            if not tb_uid:
+                continue
             try:
                 r = await http.get(
-                    f"{_api_base()}/api2/v1/termBases/{uid}/terms", headers={"Authorization": f"ApiToken {os.environ['PHRASE_API_TOKEN']}"}
+                    f"{_api_base()}/api2/v1/termBases/{tb_uid}/terms",
+                    headers=_auth(),
+                    params={"pageSize": 500},
                 )
-                terms.extend((r.json().get("terms") or [])[:500])
+                if r.status_code == 200:
+                    raw_terms.extend(r.json().get("terms") or [])
             except Exception:
-                pass
+                continue
 
     return {
         "check": bool(content_groups) and bool(term_bases),
-        "project": {"uid": project_uid, "name": details.get("name", project.get("name", "?"))},
+        "project": {
+            "uid": project_uid,
+            "name": details.get("name") or project.get("name") or "?",
+        },
         "contentGroups": [g.get("id") for g in content_groups],
         "termBases": [t.get("id") or t.get("uid") for t in term_bases],
-        "terms": terms,
-        "reason": "" if (content_groups and term_bases) else f"cg={bool(content_groups)} tb={bool(term_bases)}",
+        "preferredTerms": extract_preferred_terms(raw_terms),
+        "reason": (
+            ""
+            if (content_groups and term_bases)
+            else f"contentgroep={bool(content_groups)} termbase={bool(term_bases)}"
+        ),
     }
 
 
 @workflows.activity(name="qa-check-job")
 async def qa_check_job(payload: dict, info: dict) -> dict:
-    """Download bilingual file, pas fixes toe, schrijf terug, rapporteer."""
+    """Download bilingual file per afgeronde job, pas fixes toe, schrijf terug."""
     import httpx
 
     token = os.environ["PHRASE_API_TOKEN"]
-    auth = {"Authorization": f"ApiToken {token}", "Accept": "application/json"}
+    auth = _auth()
     project_uid = info["project"]["uid"]
-    completed = [p for p in (payload.get("jobParts") or []) if p.get("status") == "COMPLETED" and int(p.get("workflowLevel") or 1)) == 1] if False else [
-        p for p in (payload.get("jobParts") or [])
+    completed = [
+        p
+        for p in (payload.get("jobParts") or [])
         if p.get("status") == "COMPLETED" and int(p.get("workflowLevel") or 1) == 1
     ]
-    corrections: list[dict] = []
+    results: list[dict] = []
+    terms = info.get("preferredTerms", [])
+
     async with httpx.AsyncClient(timeout=180) as http:
         for part in completed:
             part_uid = part.get("uid")
-            part_id = next(iter(part_uid)) if isinstance(part_uid, dict) else part_uid
+            part_id = part_uid.get("uid") if isinstance(part_uid, dict) else part_uid
             target_lang = part.get("targetLang", "")
             try:
                 r = await http.get(
-                    f"{_api_base()}/api2/v1/projects/{project_uid}/jobs/{part_id}/bilingualFile?format=MXLF",
+                    f"{_api_base()}/api2/v1/projects/{project_uid}/jobs/{part_id}/bilingualFile",
                     headers=auth,
+                    params={"format": "MXLF"},
                 )
                 if r.status_code != 200:
-                    corrections.append({"part": part_id, "error": f"download {r.status_code}"})
+                    results.append({"part": part_id, "error": f"download {r.status_code}"})
                     continue
                 xml = r.content.decode("utf-8", errors="replace")
 
-                import re as _re
-                fixed_xml = xml
                 part_reasons: list[str] = []
+                changed_xml_holder = {"xml": xml}
 
                 def _fix_target(m):
-                    nonlocal part_reasons
-                    original = m.group(1).replace("&amp;", "&")
-                    fixed, reasons = apply_fixes(original, info["terms"], target_lang)
+                    original = m.group(1)
+                    unescaped = original.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+                    fixed, reasons = apply_fixes(unescaped, terms, target_lang)
                     if reasons:
                         part_reasons.extend(reasons)
-                        return m.group(0).replace(m.group(1), fixed.replace("&", "&amp;"))
+                        re_escaped = fixed.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                        return "<target>" + re_escaped + "</target>"
                     return m.group(0)
 
-                fixed_xml = _re.sub(r"<target>(.*?)</target>", _fix_target, xml, flags=_re.S)
+                changed_xml_holder["xml"] = re.sub(
+                    r"<target>(.*?)</target>", _fix_target, xml, flags=re.S
+                )
 
                 if part_reasons:
-                    files = {"file": ("corrected.mxlf", fixed_xml.encode("utf-8"), "application/xml")}
                     ur = await http.post(
                         f"{_api_base()}/api2/v1/projects/{project_uid}/bilingualFiles",
                         headers={"Authorization": f"ApiToken {token}"},
-                        files=files,
-                        data={
-                            "saveToTransMemory": "Confirmed",
-                            "jobParts": part_id,
-                        },
+                        files={"file": ("corrected.mxlf", changed_xml_holder["xml"].encode("utf-8"), "application/xml")},
+                        data={"saveToTransMemory": "Confirmed", "jobParts": part_id},
                     )
-                    corrections.append({
+                    results.append({
                         "part": part_id,
                         "targetLang": target_lang,
                         "reasons": part_reasons,
@@ -253,12 +289,14 @@ async def qa_check_job(payload: dict, info: dict) -> dict:
                         "uploadStatus": ur.status_code,
                     })
                 else:
-                    corrections.append({
-                        "part": part_id, "targetLang": target_lang, "reasons": [], "uploaded": False, "clean": True,
+                    results.append({
+                        "part": part_id, "targetLang": target_lang,
+                        "reasons": [], "uploaded": False, "clean": True,
                     })
             except Exception as exc:
-                corrections.append({"part": part_uid, "error": str(exc)})
-    return {"project": info["project"], "results": corrections}
+                results.append({"part": part_id, "error": str(exc)})
+
+    return {"project": info["project"], "results": results}
 
 
 @workflows.activity(name="qa-build-xlsx")
@@ -273,11 +311,13 @@ async def qa_build_xlsx(report: dict) -> str:
     for row in report["results"]:
         ws.append([
             report.get("project", {}).get("name", ""),
-            row.get("part"), row.get("targetLang", ""),
-            "; ".join(row.get("reasons", [])),
+            row.get("part"),
+            row.get("targetLang", ""),
+            "; ".join(row.get("reasons", [])) or row.get("error", ""),
             "ja" if row.get("uploaded") else "nee",
         ])
-    filename = "QA_voorvertaling_" + re.sub(r"[^A-Za-z0-9_-]+", "_", str(report.get("project", {}).get("name", "project")))[:60] + ".xlsx"
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", str(report.get("project", {}).get("name", "project")))[:60]
+    filename = f"QA_voorvertaling_{safe_name}.xlsx"
     wb.save(filename)
     return filename
 
@@ -287,9 +327,10 @@ async def qa_upload_sharepoint(
     filename: str,
     sp: ToolCallClient = Depends(sharepoint_connector),
 ) -> str:
+    import base64
+
     with open(filename, "rb") as fh:
         content = fh.read()
-    import base64
     resp = await sp.call_tool(
         tool_name="upload_binary_file",
         arguments={
