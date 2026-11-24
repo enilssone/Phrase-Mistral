@@ -6,8 +6,8 @@ Geplande workflow (schedule, dagelijks 09:00 Europe/Amsterdam) die:
    Phrase-connector (workspace credential, run_as="deployment").
 2. De projecten filtert waarvan de deadline (dateDue, omgerekend naar
    Europe/Amsterdam) op de dag van uitvoering valt.
-3. Een overzicht post in het Teams-kanaal "Phrase updates" via een
-   Incoming Webhook (workspace secret TEAMS_WEBHOOK_URL).
+3. Een overzicht post in het Teams-kanaal "Phrase updates" via de
+   Teams-connector (workspace credential, run_as="deployment").
 
 Input (optioneel, gebruikt door de schedule en handmatige runs):
     {}  of  {"date": "2026-11-24", "dry_run": true}
@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 # Module-level imports van mistralai-workflows zijn OK (geen urllib-keten);
-# alle httpx-/zoneinfo-/env-IO staat BINNEN activities (Temporal-sandbox).
+# alle zoneinfo-/env-IO staat BINNEN activities (Temporal-sandbox).
 import mistralai.workflows as workflows
 from mistralai.workflows import Depends
 from mistralai.workflows.plugins.mistralai.connectors import (
@@ -31,8 +31,14 @@ from mistralai.workflows.plugins.mistralai.connectors import (
 )
 
 phrase_connector = connector("phrase_mistral_768b", run_as="deployment")
+teams_connector = connector("teams", run_as="deployment")
 
-CHANNEL_LABEL = "Phrase updates"
+TEAMS_TEAM_ID = os.environ.get(
+    "TEAMS_TEAM_ID", "60f99958-3d93-415c-a2ff-7e62f5da25a2"
+)
+TEAMS_CHANNEL_ID = os.environ.get(
+    "TEAMS_CHANNEL_ID", "19:f12365030ece4194a88701a4efcb7b0b@thread.tacv2"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -199,20 +205,21 @@ async def digest_build_message(projects: list, today: str) -> Optional[dict]:
 
 
 @workflows.activity(name="digest-post-teams")
-async def digest_post_teams(message: dict) -> str:
-    """Post het bericht via de Incoming Webhook (secret TEAMS_WEBHOOK_URL)."""
-    import httpx
-
-    url = os.environ.get("TEAMS_WEBHOOK_URL", "")
-    if not url:
-        raise RuntimeError("TEAMS_WEBHOOK_URL is niet gezet (workspace secret ontbreekt?)")
-    async with httpx.AsyncClient(timeout=30) as http:
-        resp = await http.post(
-            url,
-            json={"title": message["subject"], "text": message["content"]},
-        )
-        resp.raise_for_status()
-    return f"geposted: {message['subject']}"
+async def digest_post_teams(
+    message: dict,
+    teams: ToolCallClient = Depends(teams_connector),
+) -> str:
+    """Post het bericht in het kanaal via de Teams-connector (workspace credential)."""
+    resp = await teams.call_tool(
+        tool_name="teams_post_channel_message",
+        arguments={
+            "team_id": TEAMS_TEAM_ID,
+            "channel_id": TEAMS_CHANNEL_ID,
+            "subject": message["subject"],
+            "content": message["content"],
+        },
+    )
+    return f"geposted: {message['subject']} ({str(resp)[:200]})"
 
 
 # ---------------------------------------------------------------------------
@@ -224,11 +231,11 @@ async def digest_post_teams(message: dict) -> str:
     workflow_display_name="Phrase deadline-overzicht (dagelijks 09:00)",
     workflow_description=(
         "Post dagelijks (09:00 Europe/Amsterdam) een overzicht van "
-        "Phrase-projecten met die dag als deadline in de Teams-kanalen "
+        "Phrase-projecten met die dag als deadline in het Teams-kanaal "
         "'Phrase updates'."
     ),
 )
-@uses_connectors(phrase_connector)
+@uses_connectors(phrase_connector, teams_connector)
 class PhraseDeadlineDigestWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, payload: Optional[dict] = None) -> str:
