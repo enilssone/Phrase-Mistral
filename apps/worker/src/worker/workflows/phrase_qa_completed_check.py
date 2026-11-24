@@ -96,6 +96,17 @@ SYSTEM_PROMPT = (
 )
 
 
+def extra_rules_for_lang(target_lang: str) -> str:
+    """Extra stijlregels per doeltaal (nu: en-GB = Brits Engels zonder Oxford comma)."""
+    lang = (target_lang or "").lower().replace("_", "-")
+    if lang == "en-gb":
+        return (
+            "- en-GB style: use British English spelling (organise, colour, centre, ...) "
+            "and NO Oxford comma in lists ('a, b and c', never 'a, b, and c')."
+        )
+    return ""
+
+
 def build_mistral_prompt(
     target_lang: str,
     terms: list[str],
@@ -108,12 +119,16 @@ def build_mistral_prompt(
         src = (s.get("source") or "").replace("\n", " ").strip()
         tgt = (s.get("target") or "").replace("\n", " ").strip()
         seg_lines.append(f"{s.get('id')} | {src} | {tgt}")
+    rules_block = rules_md.strip()
+    extra = extra_rules_for_lang(target_lang)
+    if extra:
+        rules_block = f"{rules_block}\n{extra}" if rules_block else extra
     return (
         f"Target language: {target_lang}\n\n"
         f"APPROVED TERMBASE TERMS (use these in the target; flag other variants):\n"
         f"{chr(10).join('- ' + t for t in terms) or '(none)'}\n\n"
         f"CONTENT GROUP RULES (evaluate each rule per segment):\n"
-        f"{rules_md.strip() or '(none)'}\n\n"
+        f"{rules_block or '(none)'}\n\n"
         f"SEGMENTS (id | source | target):\n" + "\n".join(seg_lines) + "\n\n"
         "CHECKS:\n"
         "1. terminology: the target must use the approved termbase terms; flag non-approved "
@@ -123,7 +138,7 @@ def build_mistral_prompt(
         "3. content-group: evaluate every rule above against each segment; flag clear "
         "violations only (segment-local verdicts).\n\n"
         'OUTPUT (JSON only): {"violations": [{"segmentId": "<id>", '
-        '"check": "terminology|consistency|content-group", "rule": "<rule or term>", '
+        '"check": "terminology|consistency|content-group|en-gb", "rule": "<rule or term>", '
         '"message": "<what is wrong>", "suggestion": "<preferred wording, if any>"}]}'
     )
 

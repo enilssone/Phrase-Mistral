@@ -2,6 +2,7 @@ from worker.workflows.phrase_qa_completed_check import (
     build_mistral_prompt,
     chunked,
     completed_parts,
+    extra_rules_for_lang,
     is_completed_pretranslation_event,
     parse_violations,
 )
@@ -66,3 +67,27 @@ def test_parse_violations_skips_malformed_entries():
 def test_chunked():
     assert chunked([1, 2, 3, 4, 5], 2) == [[1, 2], [3, 4], [5]]
     assert chunked([], 3) == []
+
+
+def test_extra_rules_en_gb_oxford_comma():
+    rule = extra_rules_for_lang("en_gb")
+    assert "British English" in rule
+    assert "Oxford comma" in rule
+    assert extra_rules_for_lang("en-GB") == rule
+    assert extra_rules_for_lang("nl_nl") == ""
+    assert extra_rules_for_lang("en_us") == ""
+
+
+def test_prompt_en_gb_includes_no_oxford_comma():
+    prompt = build_mistral_prompt(
+        "en_gb", [], "- Some rule",
+        [{"id": "1", "source": "Apples, bananas and cherries", "target": "Apples, bananas, and cherries"}],
+    )
+    assert "NO Oxford comma" in prompt
+    assert "Apples, bananas, and cherries" in prompt
+    assert '"check": "terminology|consistency|content-group|en-gb"' in prompt
+
+
+def test_prompt_non_english_has_no_oxford_rule():
+    prompt = build_mistral_prompt("nl_nl", [], "", [{"id": "1", "source": "a", "target": "b"}])
+    assert "Oxford comma" not in prompt
