@@ -60,11 +60,16 @@ MAX_SEGMENTS_PER_CALL = 40
 MAX_SEGMENTS_TOTAL = 400
 
 
+def _phrase_token() -> str:
+    """Phrase API-token uit workspace secret (PHRASE_API_TOKEN of phrase_api_token)."""
+    return os.environ.get("PHRASE_API_TOKEN") or os.environ["phrase_api_token"]
+
+
 async def _rest(method: str, path: str, query_params: Optional[dict] = None, body=None):
     """Plain Phrase REST-call (0 AIU's) met PHRASE_API_TOKEN uit workspace secret."""
     import httpx
 
-    token = os.environ["PHRASE_API_TOKEN"]
+    token = _phrase_token()
     base = os.environ.get("PHRASE_API_BASE", "https://api.phrase.com").rstrip("/")
     async with httpx.AsyncClient(timeout=120) as http:
         r = await http.request(
