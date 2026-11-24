@@ -16,6 +16,7 @@ via een webhook-trigger vertaalt naar berichten in het Teams-kanaal **Phrase upd
 ## phrase-deadline-digest
 - Leest alle niet-gearchiveerde projecten via de Phrase-connector (workspace credential, `run_as="deployment"`).
 - Filtert op deadline (dateDue, Europe/Amsterdam) gelijk aan de uitvoeringsdag.
-- Post het overzicht via de Incoming Webhook van het kanaal "Phrase updates"
-  (workspace secret `TEAMS_WEBHOOK_URL`).
+- Post het overzicht in het Teams-kanaal "Phrase updates" via de Teams-connector
+  (workspace credential, `run_as="deployment"`, zelfde kanaal als de notifier).
 - Input-opties voor handmatige runs: `{"date": "2026-11-24", "dry_run": true}`.
+- Schedule (aan te maken via Mistral Studio): dagelijks 09:00 Europe/Amsterdam, input `{}`.
