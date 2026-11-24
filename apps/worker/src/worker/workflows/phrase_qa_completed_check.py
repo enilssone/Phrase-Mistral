@@ -61,6 +61,8 @@ MISTRAL_QA_MODEL = os.environ.get("MISTRAL_QA_MODEL", "mistral-large-latest")
 # Limieten om promptgrootte behapbaar te houden.
 MAX_SEGMENTS_PER_CALL = 40
 MAX_SEGMENTS_TOTAL = 400
+# Poll-venster in minuten (module-niveau: os.environ mag niet in de workflow-body).
+QC_POLL_WINDOW_MINUTES = int(os.environ.get("QC_POLL_WINDOW_MINUTES", "20"))
 
 
 def _phrase_token() -> str:
@@ -631,8 +633,7 @@ class PhraseQaCompletedCheckWorkflow:
                 payloads = [payload]
         if not payloads:
             # poll-modus (scheduled run, zonder webhook)
-            window = int(os.environ.get("QC_POLL_WINDOW_MINUTES", "20"))
-            payloads = await qc_poll_completed(window)
+            payloads = await qc_poll_completed(QC_POLL_WINDOW_MINUTES)
             if not payloads:
                 return "geen nieuwe COMPLETED-voorvertalingen (level 1) gevonden"
 
