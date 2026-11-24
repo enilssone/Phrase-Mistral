@@ -91,3 +91,10 @@ def test_prompt_en_gb_includes_no_oxford_comma():
 def test_prompt_non_english_has_no_oxford_rule():
     prompt = build_mistral_prompt("nl_nl", [], "", [{"id": "1", "source": "a", "target": "b"}])
     assert "Oxford comma" not in prompt
+
+
+def test_consistency_check_covers_terminology():
+    prompt = build_mistral_prompt("en_gb", ["help desk"], "", [{"id": "1", "source": "a", "target": "b"}])
+    assert "identical source text must have identical target text" in prompt
+    assert "terminology must be used consistently" in prompt
+    assert "same source term must always get the same target term" in prompt

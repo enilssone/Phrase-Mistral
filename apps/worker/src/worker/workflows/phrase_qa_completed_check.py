@@ -134,7 +134,9 @@ def build_mistral_prompt(
         "1. terminology: the target must use the approved termbase terms; flag non-approved "
         "or forbidden variants.\n"
         "2. consistency: segments with identical source text must have identical target "
-        "text; flag mismatches.\n"
+        "text, AND terminology must be used consistently across all segments — the same "
+        "source term must always get the same target term; flag inconsistent term usage "
+        "and mismatched duplicates alike.\n"
         "3. content-group: evaluate every rule above against each segment; flag clear "
         "violations only (segment-local verdicts).\n\n"
         'OUTPUT (JSON only): {"violations": [{"segmentId": "<id>", '
