@@ -24,7 +24,7 @@ import json
 import os
 import re
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 import mistralai.workflows as workflows
 from mistralai.workflows import Depends
@@ -266,8 +266,8 @@ def chunked(items: list, size: int) -> list[list]:
 # --------------------------------------------------------------------------
 
 @workflows.activity(name="qc-filter-event")
-async def qc_filter_event(event: TriggerEvent) -> dict:
-    body = event.body
+async def qc_filter_event(event: Any) -> dict:
+    body = getattr(event, "body", event)
     return body if isinstance(body, dict) else {}
 
 
@@ -620,10 +620,11 @@ async def qc_notify_teams(
 @uses_connectors(teams_connector, sharepoint_connector)
 class PhraseQaCompletedCheckWorkflow:
     @workflows.workflow.entrypoint
-    async def run(self, event: Optional[TriggerEvent] = None) -> str:
+    async def run(self, event: Any = None) -> str:
         payloads: list[dict] = []
-        if event is not None:
-            payload = await qc_filter_event(event)
+        raw = getattr(event, "body", event) if event is not None else None
+        if isinstance(raw, dict) and raw:
+            payload = await qc_filter_event(raw)
             if payload:
                 if not is_completed_pretranslation_event(payload):
                     return "genegeerd: geen COMPLETED-voorvertaling op level 1"
