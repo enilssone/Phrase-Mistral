@@ -74,7 +74,7 @@ async def _rest(method: str, path: str, query_params: Optional[dict] = None, bod
 
     token = _phrase_token()
     base = os.environ.get("PHRASE_API_BASE", "https://api.phrase.com").rstrip("/")
-    async with httpx.AsyncClient(timeout=120) as http:
+    async with httpx.AsyncClient(timeout=30) as http:
         r = await http.request(
             method,
             f"{base}{path}",
@@ -378,11 +378,14 @@ async def qc_poll_completed(window_minutes: int) -> list[dict]:
     payloads: list[dict] = []
 
     projects: list[dict] = []
-    for page in range(5):
-        resp = await _rest(
-            "GET", "/api2/v1/projects",
-            query_params={"pageNumber": page, "pageSize": 50, "includeArchived": "false"},
-        )
+    for page in range(3):
+        try:
+            resp = await _rest(
+                "GET", "/api2/v1/projects",
+                query_params={"pageNumber": page, "pageSize": 50, "includeArchived": "false"},
+            )
+        except Exception:
+            break
         content = resp.get("content", []) if isinstance(resp, dict) else []
         projects.extend(content)
         if len(content) < 50:
