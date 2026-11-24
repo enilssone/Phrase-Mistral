@@ -1,10 +1,17 @@
+from datetime import datetime, timedelta, timezone
+
 from worker.workflows.phrase_qa_completed_check import (
+    MARKER,
     build_mistral_prompt,
     chunked,
     completed_parts,
     extra_rules_for_lang,
+    find_completed_at,
     is_completed_pretranslation_event,
+    is_within_window,
+    parse_iso_ts,
     parse_violations,
+    text_has_marker,
 )
 
 
@@ -98,3 +105,33 @@ def test_consistency_check_covers_terminology():
     assert "identical source text must have identical target text" in prompt
     assert "terminology must be used consistently" in prompt
     assert "same source term must always get the same target term" in prompt
+
+
+def test_parse_iso_ts():
+    assert parse_iso_ts("2026-11-24T10:00:00Z").tzinfo is not None
+    assert parse_iso_ts("2026-11-24T10:00:00+00:00") is not None
+    assert parse_iso_ts("geen datum") is None
+    assert parse_iso_ts(None) is None
+
+
+def test_find_completed_at_and_window():
+    now = datetime(2026, 11, 24, 12, 0, tzinfo=timezone.utc)
+    changes = {
+        "statusChanges": [
+            {"jobUid": "j1", "status": "NEW", "dateCreated": "2026-11-24T09:00:00Z"},
+            {"jobUid": "j1", "status": "COMPLETED", "dateCreated": "2026-11-24T11,50".replace(",", ":") + ":00Z"},
+            {"jobUid": "j2", "status": "COMPLETED", "dateCreated": "2026-11-24T08:00:00Z"},
+        ]
+    }
+    ts = find_completed_at(changes, "j1")
+    assert ts is not None
+    assert is_within_window(ts, now, 20)
+    ts2 = find_completed_at(changes, "j2")
+    assert ts2 is not None and not is_within_window(ts2, now, 20)
+    assert find_completed_at(changes, "onbekend") is None
+    assert not is_within_window(None, now, 20)
+
+
+def test_text_has_marker():
+    assert text_has_marker(f'comment met {MARKER} erin')
+    assert not text_has_marker("gewone comment")

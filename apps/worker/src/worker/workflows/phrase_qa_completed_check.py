@@ -1,7 +1,12 @@
 """Kwaliteitscontrole na voorvertaling (Completed) — checks via Mistral, 0 AIU's in Phrase.
 
-Getriggerd door de Phrase event-webhook (JOB_STATUS_CHANGED) zodra een job op
-workflow level 1 (voorvertaling) op COMPLETED staat.
+Twee modi:
+- event: Phrase event-webhook (JOB_STATUS_CHANGED) zodra een job op workflow
+  level 1 (voorvertaling) op COMPLETED staat;
+- poll (default bij scheduled run, géén webhook nodig): zoekt in Phrase TMS naar
+  jobs op level 1 die zojuist COMPLETED zijn geworden (statusChanges binnen het
+  venster) en controleert die. Een marker-comment in Phrase voorkomt dubbele
+  verwerking.
 
 Alle data (segmenten, termbase, contentgroep-regels) komt uit gewone Phrase
 REST-calls met PHRASE_API_TOKEN (0 AIU's). De checks zelf worden uitgevoerd
@@ -18,6 +23,7 @@ Rapport (Excel) -> SharePoint-map "Mistral QA voorvertaling", melding in Teams.
 import json
 import os
 import re
+from datetime import datetime, timezone
 from typing import Optional
 
 import mistralai.workflows as workflows
@@ -82,6 +88,57 @@ def completed_parts(payload: dict) -> list[dict]:
         for p in (payload.get("jobParts") or [])
         if p.get("status") == "COMPLETED" and int(p.get("workflowLevel") or 1) == 1
     ]
+
+
+# Marker-comment in Phrase om verwerkte jobs te onthouden (dedupe bij polling).
+MARKER = "[mistral-qa-completed-check]"
+
+
+def parse_iso_ts(value) -> Optional[datetime]:
+    """Parseert een ISO-8601 timestamp (Z of offset) naar aware datetime."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
+def find_completed_at(changes, job_uid: str) -> Optional[datetime]:
+    """Vindt de meest recente COMPLETED-status change voor een job (tolerant formaat)."""
+    items = []
+    if isinstance(changes, dict):
+        items = changes.get("statusChanges") or changes.get("changes") or []
+        if isinstance(items, dict):
+            items = items.get(job_uid) or []
+    elif isinstance(changes, list):
+        items = changes
+    best: Optional[datetime] = None
+    for c in items:
+        if not isinstance(c, dict):
+            continue
+        uid = c.get("jobUid") or c.get("uid") or c.get("job", {}).get("uid") if isinstance(c.get("job"), dict) else c.get("jobUid") or c.get("uid")
+        if uid and str(uid) != str(job_uid):
+            continue
+        if str(c.get("status") or c.get("newStatus") or "").upper() != "COMPLETED":
+            continue
+        ts = parse_iso_ts(c.get("dateCreated") or c.get("createdAt") or c.get("timestamp") or c.get("date"))
+        if ts and (best is None or ts > best):
+            best = ts
+    return best
+
+
+def is_within_window(ts: Optional[datetime], now: datetime, window_minutes: int) -> bool:
+    if ts is None:
+        return False
+    return (now - ts).total_seconds() <= window_minutes * 60
+
+
+def text_has_marker(text: str) -> bool:
+    return MARKER in (text or "")
 
 
 # --------------------------------------------------------------------------
@@ -440,6 +497,113 @@ async def qc_notify_teams(
     return str(resp)
 
 
+@workflows.activity(name="qc-poll-completed")
+async def qc_poll_completed(window_minutes: int) -> list[dict]:
+    """Zoekt jobs op level 1 die binnen het venster COMPLETED zijn geworden (poll-modus)."""
+    import httpx
+
+    base = _tms_base()
+    auth = _auth()
+    now = datetime.now(timezone.utc)
+    payloads: list[dict] = []
+
+    async with httpx.AsyncClient(timeout=120) as http:
+        projects: list[dict] = []
+        for page in range(5):
+            r = await http.get(
+                f"{base}/api2/v1/projects",
+                headers=auth,
+                params={"pageNumber": page, "pageSize": 50, "includeArchived": "false"},
+            )
+            if r.status_code != 200:
+                break
+            content = r.json().get("content", [])
+            projects.extend(content)
+            if len(content) < 50:
+                break
+
+        candidates: list[tuple[dict, dict]] = []
+        for p in projects:
+            puid = p.get("uid")
+            if not puid:
+                continue
+            try:
+                r = await http.get(
+                    f"{base}/api2/v2/projects/{puid}/jobs",
+                    headers=auth,
+                    params={"workflowLevel": 1, "status": ["COMPLETED"], "pageSize": 50},
+                )
+                if r.status_code != 200:
+                    continue
+                for j in r.json().get("content", []):
+                    candidates.append(({"uid": puid, "name": p.get("name") or puid}, j))
+            except Exception:
+                continue
+
+        for i in range(0, len(candidates), 100):
+            batch = candidates[i : i + 100]
+            try:
+                r = await http.post(
+                    f"{base}/api2/v2/jobs/statusChanges",
+                    headers=auth,
+                    params={"order": "DESC"},
+                    json={"jobs": [{"uid": j.get("uid")} for _, j in batch]},
+                )
+                changes = r.json() if r.status_code == 200 else {}
+            except Exception:
+                changes = {}
+            for proj, j in batch:
+                juid = j.get("uid")
+                completed_at = find_completed_at(changes, juid)
+                if not is_within_window(completed_at, now, window_minutes):
+                    continue
+                if await _has_marker(http, base, auth, juid):
+                    continue
+                payloads.append(
+                    {
+                        "project": proj,
+                        "jobParts": [
+                            {
+                                "uid": juid,
+                                "status": "COMPLETED",
+                                "workflowLevel": 1,
+                                "targetLang": j.get("targetLang", ""),
+                            }
+                        ],
+                    }
+                )
+    return payloads
+
+
+async def _has_marker(http, base: str, auth: dict, job_uid: str) -> bool:
+    try:
+        r = await http.get(f"{base}/api2/v1/jobs/{job_uid}/conversations/plains", headers=auth)
+        if r.status_code == 200 and text_has_marker(r.text):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+@workflows.activity(name="qc-mark-processed")
+async def qc_mark_processed(job_uid: str) -> bool:
+    """Plaatst de marker-comment op de job zodat polling niet dubbel verwerkt."""
+    import httpx
+
+    base = _tms_base()
+    auth = _auth()
+    async with httpx.AsyncClient(timeout=60) as http:
+        r = await http.post(
+            f"{base}/api2/v3/jobs/{job_uid}/conversations/plains",
+            headers=auth,
+            json={
+                "references": [],
+                "comment": {"text": f"{MARKER} kwaliteitscontrole na voorvertaling (Completed) uitgevoerd via Mistral, 0 AIU's."},
+            },
+        )
+        return r.status_code in (200, 201)
+
+
 @workflows.workflow.define(
     name="phrase-qa-completed-check",
     workflow_display_name="Kwaliteitscontrole na voorvertaling (Completed) — Mistral",
@@ -452,16 +616,46 @@ async def qc_notify_teams(
 @uses_connectors(teams_connector, sharepoint_connector)
 class PhraseQaCompletedCheckWorkflow:
     @workflows.workflow.entrypoint
-    async def run(self, event: TriggerEvent) -> str:
-        payload = await qc_filter_event(event)
-        if not is_completed_pretranslation_event(payload):
-            return "genegeerd: geen COMPLETED-voorvertaling op level 1"
-        context = await qc_fetch_context(payload)
-        if not context.get("check"):
-            return f"genegeerd: {context.get('reason')}"
-        report = await qc_mistral_check(context)
-        if report.get("error"):
-            return f"fout: {report['error']}"
-        filename = await qc_build_xlsx(report)
+    async def run(self, event: Optional[TriggerEvent] = None) -> str:
+        payloads: list[dict] = []
+        if event is not None:
+            payload = await qc_filter_event(event)
+            if payload:
+                if not is_completed_pretranslation_event(payload):
+                    return "genegeerd: geen COMPLETED-voorvertaling op level 1"
+                payloads = [payload]
+        if not payloads:
+            # poll-modus (scheduled run, zonder webhook)
+            window = int(os.environ.get("QC_POLL_WINDOW_MINUTES", "20"))
+            payloads = await qc_poll_completed(window)
+            if not payloads:
+                return "geen nieuwe COMPLETED-voorvertalingen (level 1) gevonden"
+
+        all_violations: list[dict] = []
+        segment_count = 0
+        processed: list[str] = []
+        for payload in payloads:
+            context = await qc_fetch_context(payload)
+            if not context.get("check"):
+                continue
+            report = await qc_mistral_check(context)
+            if report.get("error"):
+                return f"fout: {report['error']}"
+            segment_count += report.get("segmentCount", 0)
+            pname = context["project"]["name"]
+            for v in report.get("violations", []):
+                v["project"] = pname
+                all_violations.append(v)
+            for part in context.get("parts", []):
+                await qc_mark_processed(part["uid"])
+                processed.append(part["uid"])
+
+        agg = {
+            "project": {"name": f"{len(processed)} voorvertaling-job(s)"},
+            "segmentCount": segment_count,
+            "violationCount": len(all_violations),
+            "violations": all_violations,
+        }
+        filename = await qc_build_xlsx(agg)
         await qc_upload_sharepoint(filename)
-        return await qc_notify_teams(report)
+        return await qc_notify_teams(agg)
