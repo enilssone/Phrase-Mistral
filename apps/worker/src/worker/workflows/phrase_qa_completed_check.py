@@ -35,8 +35,11 @@ from mistralai.workflows.plugins.mistralai.connectors import (
 )
 from mistralai.workflows.plugins.triggers import TriggerEvent
 
-teams_connector = connector("teams", run_as="deployment")
-sharepoint_connector = connector("sharepoint_mcp", run_as="deployment")
+# auto_auth=False: de preflight faalt hard als de deployment nog geen
+# workspace-credential heeft; rapportgage (Teams/SharePoint) is best-effort en
+# mag de QA-core (poll + Mistral-checks + marker) nooit blokkeren.
+teams_connector = connector("teams", run_as="deployment", auto_auth=False)
+sharepoint_connector = connector("sharepoint_mcp", run_as="deployment", auto_auth=False)
 
 SHAREPOINT_DRIVE_ID = os.environ.get(
     "SHAREPOINT_DRIVE_ID",
@@ -644,6 +647,17 @@ class PhraseQaCompletedCheckWorkflow:
             "violationCount": len(all_violations),
             "violations": all_violations,
         }
+        notes: list[str] = []
         filename = await qc_build_xlsx(agg)
-        await qc_upload_sharepoint(filename)
-        return await qc_notify_teams(agg)
+        try:
+            await qc_upload_sharepoint(filename)
+        except Exception as exc:
+            notes.append(f"sharepoint-upload mislukt (workspace-credential?): {exc}")
+        try:
+            result = await qc_notify_teams(agg)
+        except Exception as exc:
+            notes.append(f"teams-melding mislukt (workspace-credential?): {exc}")
+            result = "rapport niet gemeld via Teams"
+        if notes:
+            return result + " | " + "; ".join(notes)
+        return result
