@@ -391,20 +391,30 @@ async def qc_poll_completed(window_minutes: int) -> list[dict]:
         if len(content) < 50:
             break
 
+    import asyncio
+
     candidates: list[tuple[dict, dict]] = []
-    for p in projects:
+    sem = asyncio.Semaphore(10)
+
+    async def _jobs_for(p: dict) -> list[tuple[dict, dict]]:
         puid = p.get("uid")
         if not puid:
-            continue
-        try:
-            resp = await _rest(
-                "GET", f"/api2/v2/projects/{puid}/jobs",
-                query_params={"workflowLevel": 1, "status": ["COMPLETED"], "pageSize": 50},
-            )
-            for j in (resp.get("content", []) if isinstance(resp, dict) else []):
-                candidates.append(({"uid": puid, "name": p.get("name") or puid}, j))
-        except Exception:
-            continue
+            return []
+        async with sem:
+            try:
+                resp = await _rest(
+                    "GET", f"/api2/v2/projects/{puid}/jobs",
+                    query_params={"workflowLevel": 1, "status": ["COMPLETED"], "pageSize": 50},
+                )
+                return [
+                    ({"uid": puid, "name": p.get("name") or puid}, j)
+                    for j in (resp.get("content", []) if isinstance(resp, dict) else [])
+                ]
+            except Exception:
+                return []
+
+    for result in await asyncio.gather(*[_jobs_for(p) for p in projects]):
+        candidates.extend(result)
 
     for i in range(0, len(candidates), 100):
         batch = candidates[i : i + 100]
