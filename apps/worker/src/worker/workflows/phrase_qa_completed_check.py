@@ -1,16 +1,19 @@
 """Kwaliteitscontrole na voorvertaling (Completed) — checks via Mistral, 0 AIU's in Phrase.
 
-Gebruikt de Mistral-connectors van de gebruiker: `phrase_mistral_768b` (Phrase),
-`teams` en `sharepoint_mcp`. Alle Phrase-data loopt via de Phrase-connector
-(0 AIU's); de checks zelf worden door een Mistral-model uitgevoerd.
+Connectors: `teams` en `sharepoint_mcp` (run_as=deployment). Phrase-data loopt via
+plain REST met PHRASE_API_TOKEN uit een workspace secret (de user-scope connector
+`phrase_mistral_768b` is niet bruikbaar voor unattended runs; als die later op
+workspace-niveau gedeeld wordt, kan `_rest` omgewisseld worden voor de connector).
+0 AIU's: alle Phrase-calls zijn gewone REST; de checks zelf worden door een
+Mistral-model uitgevoerd (MISTRAL_API_KEY workspace secret).
 
 Twee modi:
 - event: Phrase event-webhook (JOB_STATUS_CHANGED) zodra een job op workflow
   level 1 (voorvertaling) op COMPLETED staat;
-- poll (default bij scheduled run, géén webhook nodig): zoekt via de
-  Phrase-connector naar jobs op level 1 die zojuist COMPLETED zijn geworden
-  (statusChanges binnen het venster) en controleert die. Een marker-comment in
-  Phrase voorkomt dubbele verwerking.
+- poll (default bij scheduled run, géén webhook nodig): zoekt in Phrase TMS naar
+  jobs op level 1 die zojuist COMPLETED zijn geworden (statusChanges binnen het
+  venster) en controleert die. Een marker-comment in Phrase voorkomt dubbele
+  verwerking.
 
 Checks per job: consistentie (incl. consistente terminologie), termbase-
 terminologie en contentgroep-regels (+ en-GB: Brits Engels zonder Oxford comma).
@@ -32,7 +35,6 @@ from mistralai.workflows.plugins.mistralai.connectors import (
 )
 from mistralai.workflows.plugins.triggers import TriggerEvent
 
-phrase_connector = connector("phrase_mistral_768b", run_as="deployment")
 teams_connector = connector("teams", run_as="deployment")
 sharepoint_connector = connector("sharepoint_mcp", run_as="deployment")
 
@@ -58,35 +60,24 @@ MAX_SEGMENTS_PER_CALL = 40
 MAX_SEGMENTS_TOTAL = 400
 
 
-def _unwrap(resp) -> dict:
-    """Maakt van een connector-antwoord een dict (met evt. 'response'-wrapper)."""
-    if isinstance(resp, dict):
-        data = resp
-    else:
-        data = json.loads(str(resp))
-    if isinstance(data, dict) and isinstance(data.get("response"), (dict, list)):
-        return data["response"]
-    return data
+async def _rest(method: str, path: str, query_params: Optional[dict] = None, body=None):
+    """Plain Phrase REST-call (0 AIU's) met PHRASE_API_TOKEN uit workspace secret."""
+    import httpx
 
-
-async def _phrase(
-    ph: ToolCallClient,
-    tool: str,
-    method: str,
-    path: str,
-    query_params: Optional[dict] = None,
-    body=None,
-):
-    resp = await ph.call_tool(
-        tool_name=tool,
-        arguments={
-            "method": method,
-            "path": path,
-            "query_params": query_params or {},
-            "body": body,
-        },
-    )
-    return _unwrap(resp)
+    token = os.environ["PHRASE_API_TOKEN"]
+    base = os.environ.get("PHRASE_API_BASE", "https://api.phrase.com").rstrip("/")
+    async with httpx.AsyncClient(timeout=120) as http:
+        r = await http.request(
+            method,
+            f"{base}{path}",
+            params=query_params,
+            json=body,
+            headers={"Authorization": f"ApiToken {token}", "Accept": "application/json"},
+        )
+        r.raise_for_status()
+        if "json" in r.headers.get("content-type", ""):
+            return r.json()
+        return {"content": r.text}
 
 
 def is_completed_pretranslation_event(payload: dict) -> bool:
@@ -263,7 +254,7 @@ def chunked(items: list, size: int) -> list[list]:
 
 
 # --------------------------------------------------------------------------
-# Activities (Phrase via phrase_mistral_768b-connector)
+# Activities
 # --------------------------------------------------------------------------
 
 @workflows.activity(name="qc-filter-event")
@@ -273,8 +264,8 @@ async def qc_filter_event(event: TriggerEvent) -> dict:
 
 
 @workflows.activity(name="qc-fetch-context")
-async def qc_fetch_context(payload: dict, ph: ToolCallClient = Depends(phrase_connector)) -> dict:
-    """Haalt project, termbase-termen, contentgroep-regels en segmenten op via de Phrase-connector."""
+async def qc_fetch_context(payload: dict) -> dict:
+    """Haalt project, termbase-termen, contentgroep-regels en segmenten op (0 AIU)."""
     project = payload.get("project") or {}
     project_uid = project.get("uid")
     if not project_uid:
@@ -282,9 +273,9 @@ async def qc_fetch_context(payload: dict, ph: ToolCallClient = Depends(phrase_co
 
     parts = completed_parts(payload)
 
-    details = await _phrase(ph, "tms_read_api", "GET", f"/api2/v2/projects/{project_uid}")
+    details = await _rest("GET", f"/api2/v2/projects/{project_uid}")
 
-    term_bases_resp = await _phrase(ph, "tms_read_api", "GET", f"/api2/v1/projects/{project_uid}/termBases")
+    term_bases_resp = await _rest("GET", f"/api2/v1/projects/{project_uid}/termBases")
     term_bases = term_bases_resp.get("termBases", []) if isinstance(term_bases_resp, dict) else []
 
     raw_terms: list = []
@@ -293,9 +284,8 @@ async def qc_fetch_context(payload: dict, ph: ToolCallClient = Depends(phrase_co
         if not tb_uid:
             continue
         try:
-            terms_resp = await _phrase(
-                ph, "tms_read_api", "GET", f"/api2/v1/termBases/{tb_uid}/terms",
-                query_params={"pageSize": 500},
+            terms_resp = await _rest(
+                "GET", f"/api2/v1/termBases/{tb_uid}/terms", query_params={"pageSize": 500}
             )
             for entry in (terms_resp.get("terms") or []) if isinstance(terms_resp, dict) else []:
                 items = entry.get("terms") if isinstance(entry, dict) else None
@@ -308,7 +298,7 @@ async def qc_fetch_context(payload: dict, ph: ToolCallClient = Depends(phrase_co
         except Exception:
             continue
 
-    cg_resp = await _phrase(ph, "tms_read_api", "GET", f"/api2/v1/projects/{project_uid}/contentGroups")
+    cg_resp = await _rest("GET", f"/api2/v1/projects/{project_uid}/contentGroups")
     content_groups = cg_resp.get("contentGroups", []) if isinstance(cg_resp, dict) else []
 
     rules_md_parts: list[str] = []
@@ -317,7 +307,7 @@ async def qc_fetch_context(payload: dict, ph: ToolCallClient = Depends(phrase_co
         if not gid:
             continue
         try:
-            export = await _phrase(ph, "style_guides_read_api", "GET", f"/api/v1/rules/{gid}/export")
+            export = await _rest("GET", f"/api/v1/rules/{gid}/export")
             text = export.get("content") if isinstance(export, dict) else str(export)
             if text and text.strip():
                 rules_md_parts.append(text.strip())
@@ -330,8 +320,8 @@ async def qc_fetch_context(payload: dict, ph: ToolCallClient = Depends(phrase_co
         part_id = part_uid.get("uid") if isinstance(part_uid, dict) else part_uid
         target_lang = part.get("targetLang", "")
         try:
-            seg_resp = await _phrase(
-                ph, "tms_read_api", "GET",
+            seg_resp = await _rest(
+                "GET",
                 f"/api2/v1/projects/{project_uid}/jobs/{part_id}/segments",
                 query_params={"beginIndex": 0, "endIndex": MAX_SEGMENTS_TOTAL - 1},
             )
@@ -374,15 +364,15 @@ async def qc_fetch_context(payload: dict, ph: ToolCallClient = Depends(phrase_co
 
 
 @workflows.activity(name="qc-poll-completed")
-async def qc_poll_completed(window_minutes: int, ph: ToolCallClient = Depends(phrase_connector)) -> list[dict]:
+async def qc_poll_completed(window_minutes: int) -> list[dict]:
     """Zoekt jobs op level 1 die binnen het venster COMPLETED zijn geworden (poll-modus)."""
     now = datetime.now(timezone.utc)
     payloads: list[dict] = []
 
     projects: list[dict] = []
     for page in range(5):
-        resp = await _phrase(
-            ph, "tms_read_api", "GET", "/api2/v1/projects",
+        resp = await _rest(
+            "GET", "/api2/v1/projects",
             query_params={"pageNumber": page, "pageSize": 50, "includeArchived": "false"},
         )
         content = resp.get("content", []) if isinstance(resp, dict) else []
@@ -396,8 +386,8 @@ async def qc_poll_completed(window_minutes: int, ph: ToolCallClient = Depends(ph
         if not puid:
             continue
         try:
-            resp = await _phrase(
-                ph, "tms_read_api", "GET", f"/api2/v2/projects/{puid}/jobs",
+            resp = await _rest(
+                "GET", f"/api2/v2/projects/{puid}/jobs",
                 query_params={"workflowLevel": 1, "status": ["COMPLETED"], "pageSize": 50},
             )
             for j in (resp.get("content", []) if isinstance(resp, dict) else []):
@@ -408,8 +398,8 @@ async def qc_poll_completed(window_minutes: int, ph: ToolCallClient = Depends(ph
     for i in range(0, len(candidates), 100):
         batch = candidates[i : i + 100]
         try:
-            changes = await _phrase(
-                ph, "tms_read_api", "POST", "/api2/v2/jobs/statusChanges",
+            changes = await _rest(
+                "POST", "/api2/v2/jobs/statusChanges",
                 query_params={"order": "DESC"},
                 body={"jobs": [{"uid": j.get("uid")} for _, j in batch]},
             )
@@ -421,7 +411,7 @@ async def qc_poll_completed(window_minutes: int, ph: ToolCallClient = Depends(ph
             if not is_within_window(completed_at, now, window_minutes):
                 continue
             try:
-                conv = await _phrase(ph, "tms_read_api", "GET", f"/api2/v1/jobs/{juid}/conversations/plains")
+                conv = await _rest("GET", f"/api2/v1/jobs/{juid}/conversations/plains")
                 if text_has_marker(json.dumps(conv)):
                     continue
             except Exception:
@@ -443,11 +433,11 @@ async def qc_poll_completed(window_minutes: int, ph: ToolCallClient = Depends(ph
 
 
 @workflows.activity(name="qc-mark-processed")
-async def qc_mark_processed(job_uid: str, ph: ToolCallClient = Depends(phrase_connector)) -> bool:
+async def qc_mark_processed(job_uid: str) -> bool:
     """Plaatst de marker-comment op de job zodat polling niet dubbel verwerkt."""
     try:
-        await _phrase(
-            ph, "tms_write_api", "POST", f"/api2/v3/jobs/{job_uid}/conversations/plains",
+        await _rest(
+            "POST", f"/api2/v3/jobs/{job_uid}/conversations/plains",
             body={
                 "references": [],
                 "comment": {"text": f"{MARKER} kwaliteitscontrole na voorvertaling (Completed) uitgevoerd via Mistral, 0 AIU's."},
@@ -602,11 +592,11 @@ async def qc_notify_teams(
     workflow_description=(
         "Bij elke voorvertaling die op Completed staat (JOB_STATUS_CHANGED of poll op workflow level 1): "
         "kwaliteitscontrole via Mistral — consistentie (incl. terminologie), termbase-terminologie, "
-        "contentgroep-regels en en-GB zonder Oxford comma. Phrase-data via de phrase_mistral_768b-connector "
-        "(0 AIU's); checks worden door Mistral uitgevoerd."
+        "contentgroep-regels en en-GB zonder Oxford comma. Phrase-data via plain REST (0 AIU's); "
+        "Teams/SharePoint via connectors."
     ),
 )
-@uses_connectors(phrase_connector, teams_connector, sharepoint_connector)
+@uses_connectors(teams_connector, sharepoint_connector)
 class PhraseQaCompletedCheckWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, event: Optional[TriggerEvent] = None) -> str:
