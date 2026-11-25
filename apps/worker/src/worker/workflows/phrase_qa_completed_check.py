@@ -58,6 +58,50 @@ TEAMS_CHANNEL_ID = os.environ.get(
 MISTRAL_API_BASE = os.environ.get("MISTRAL_API_BASE", "https://api.mistral.ai/v1").rstrip("/")
 MISTRAL_QA_MODEL = os.environ.get("MISTRAL_QA_MODEL", "mistral-large-latest")
 
+# Microsoft Graph (voor persoonlijke Teams-DM naar de project-eigenaar).
+# Maak in Azure een app-registratie met application permission Chat.ReadWrite.All
+# (+ admin consent) en zet tenant/client id/secret als workspace secrets.
+MS_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+MS_GRAPH_TENANT_ID = os.environ.get("MS_GRAPH_TENANT_ID", "")
+MS_GRAPH_CLIENT_ID = os.environ.get("MS_GRAPH_CLIENT_ID", "")
+MS_GRAPH_CLIENT_SECRET = os.environ.get("MS_GRAPH_CLIENT_SECRET", "")
+MS_GRAPH_TOKEN = os.environ.get("MS_GRAPH_TOKEN", "")  # alternatief: pre-issued token
+
+
+async def _graph_token() -> str:
+    if MS_GRAPH_TOKEN:
+        return MS_GRAPH_TOKEN
+    import httpx
+
+    async with httpx.AsyncClient(timeout=30) as http:
+        r = await http.post(
+            f"https://login.microsoftonline.com/{MS_GRAPH_TENANT_ID}/oauth2/v2.0/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": MS_GRAPH_CLIENT_ID,
+                "client_secret": MS_GRAPH_CLIENT_SECRET,
+                "scope": "https://graph.microsoft.com/.default",
+            },
+        )
+        r.raise_for_status()
+        return r.json()["access_token"]
+
+
+async def _graph(method: str, path: str, body=None):
+    import httpx
+
+    token = await _graph_token()
+    async with httpx.AsyncClient(timeout=30) as http:
+        r = await http.request(
+            method, f"{MS_GRAPH_BASE}{path}",
+            json=body,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json() if r.content else {}
+
 # Limieten om promptgrootte behapbaar te houden.
 MAX_SEGMENTS_PER_CALL = 40
 MAX_SEGMENTS_TOTAL = 400
@@ -685,6 +729,46 @@ async def qc_upload_sharepoint(
     return m.group(0) if m else text
 
 
+@workflows.activity(name="qc-dm-owner")
+async def qc_dm_owner(owner_email: str, project_name: str, vcount: int, report_url: str) -> str:
+    """Persoonlijk Teams-bericht (DM) naar de project-eigenaar via Microsoft Graph."""
+    if not owner_email:
+        return "geen owner-email"
+    if not (MS_GRAPH_TOKEN or (MS_GRAPH_TENANT_ID and MS_GRAPH_CLIENT_ID and MS_GRAPH_CLIENT_SECRET)):
+        return "geen MS Graph credentials (secrets ms_graph_*)"
+    user = await _graph("GET", f"/users/{owner_email}")
+    if not user or not user.get("id"):
+        return f"gebruiker niet gevonden in Entra: {owner_email}"
+    chat = await _graph(
+        "POST", "/chats",
+        {
+            "chatType": "oneOnOne",
+            "members": [
+                {
+                    "@odata.type": "#microsoft.graph.aadUserConversationMember",
+                    "roles": ["owner"],
+                    "user@odata.bind": f"{MS_GRAPH_BASE}/users/{user['id']}",
+                }
+            ],
+        },
+    )
+    chat_id = (chat or {}).get("id")
+    if not chat_id:
+        return "chat aanmaken mislukt"
+    content = (
+        f"De voorvertaling van project {project_name} is klaar en de kwaliteitscontroles zijn door "
+        f"Mistral uitgevoerd. Je kunt de voorvertaling nu naar de post-editor sturen.\n"
+        f"Bevindingen: {vcount}."
+    )
+    if report_url and report_url.startswith("http"):
+        content += f"\nRapport met wijzigingen (SharePoint): {report_url}"
+    await _graph(
+        "POST", f"/chats/{chat_id}/messages",
+        {"body": {"contentType": "text", "content": content}},
+    )
+    return f"DM naar {owner_email} (project {project_name})"
+
+
 @workflows.activity(name="qc-notify-teams")
 async def qc_notify_teams(
     report: dict,
@@ -822,11 +906,20 @@ class PhraseQaCompletedCheckWorkflow:
             report_url = await qc_upload_sharepoint(filename)
         except Exception as exc:
             notes.append(f"sharepoint-upload mislukt (workspace-credential?): {exc}")
+        # 1) persoonlijk DM naar elke owner via Microsoft Graph (als credentials er zijn)
+        for o in owners:
+            if o.get("email"):
+                try:
+                    dm = await qc_dm_owner(o["email"], o.get("project") or "?", len(all_violations), report_url)
+                    notes.append(dm)
+                except Exception as exc:
+                    notes.append(f"DM naar {o.get('email')} mislukt: {exc}")
+        # 2) fallback/kanaal: melding in 'Phrase updates' met owner-mentions
         try:
             result = await qc_notify_teams(agg, owners, report_url)
         except Exception as exc:
-            notes.append(f"teams-melding mislukt (workspace-credential?): {exc}")
-            result = "rapport niet gemeld via Teams"
+            notes.append(f"teams-kanaalmelding mislukt (workspace-credential?): {exc}")
+            result = "rapport niet gemeld via Teams-kanaal"
         if notes:
             return result + " | " + "; ".join(notes)
         return result
