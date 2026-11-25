@@ -39,8 +39,8 @@ from mistralai.workflows.plugins.triggers import TriggerEvent
 # resolveert dit naar de identity van de trigger/schedule-eigenaar (bijv. enilsson),
 # NIET naar de deployment-serviceaccount (die heeft geen connector-consumers).
 # auto_auth=False: preflight mag de QA-core nooit blokkeren.
-teams_connector = connector("teams", auto_auth=False)
-sharepoint_connector = connector("sharepoint_mcp", auto_auth=False)
+teams_connector = connector("teams", run_as="deployment", auto_auth=False)
+sharepoint_connector = connector("sharepoint_mcp", run_as="deployment", auto_auth=False)
 
 SHAREPOINT_DRIVE_ID = os.environ.get(
     "SHAREPOINT_DRIVE_ID",
