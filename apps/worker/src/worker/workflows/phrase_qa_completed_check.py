@@ -704,7 +704,10 @@ async def qc_notify_teams(
         email = o.get("email") or ""
         name = o.get("name") or o.get("userName") or email
         proj = o.get("project") or "?"
-        line = f"- Project **{proj}**: voorvertaling + QA-check uitgevoerd"
+        line = (
+            f"- De voorvertaling van project **{proj}** is klaar en de kwaliteitscontroles zijn door "
+            f"Mistral uitgevoerd. Je kunt de voorvertaling nu naar de post-editor sturen."
+        )
         if email:
             try:
                 members = await teams.call_tool(
@@ -723,7 +726,8 @@ async def qc_notify_teams(
         owner_lines.append(line)
 
     content = (
-        f"Voorvertaling(en) op Completed — kwaliteitscontrole uitgevoerd via Mistral (0 AIU's in Phrase)."
+        f"De voorvertaling van project **{p}** is klaar en de kwaliteitscontroles zijn door Mistral uitgevoerd. "
+        f"Je kunt de voorvertaling nu naar de post-editor sturen."
         f"\n- Segmenten gecontroleerd: {scount}"
         f"\n- Bevindingen: {vcount} ({breakdown})"
         f"\n- Checks: consistentie (incl. terminologie), termbase-terminologie, contentgroep-regels, en-GB zonder Oxford comma."
