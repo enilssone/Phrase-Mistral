@@ -63,6 +63,9 @@ MAX_SEGMENTS_PER_CALL = 40
 MAX_SEGMENTS_TOTAL = 400
 # Poll-venster in minuten (module-niveau: os.environ mag niet in de workflow-body).
 QC_POLL_WINDOW_MINUTES = int(os.environ.get("QC_POLL_WINDOW_MINUTES", "20"))
+# Vaste Phrase-map (project) waarin elk QA-rapport als bestand wordt geplaatst.
+REPORT_PROJECT_NAME = os.environ.get("PHRASE_REPORT_PROJECT_NAME", "QA-checks na voorvertaling (Mistral)")
+REPORT_PROJECT_UID = os.environ.get("PHRASE_REPORT_PROJECT_UID", "")
 
 
 def _phrase_token() -> str:
@@ -70,24 +73,44 @@ def _phrase_token() -> str:
     return os.environ.get("PHRASE_API_TOKEN") or os.environ["phrase_api_token"]
 
 
+def _rest_headers() -> dict:
+    return {"Authorization": f"ApiToken {_phrase_token()}", "Accept": "application/json"}
+
+
 async def _rest(method: str, path: str, query_params: Optional[dict] = None, body=None):
     """Plain Phrase REST-call (0 AIU's) met PHRASE_API_TOKEN uit workspace secret."""
     import httpx
 
-    token = _phrase_token()
-    base = os.environ.get("PHRASE_API_BASE", "https://api.phrase.com").rstrip("/")
+    base = os.environ.get("PHRASE_API_BASE", "https://api_phrase.com").rstrip("/")
     async with httpx.AsyncClient(timeout=30) as http:
         r = await http.request(
             method,
             f"{base}{path}",
             params=query_params,
             json=body,
-            headers={"Authorization": f"ApiToken {token}", "Accept": "application/json"},
+            headers=_rest_headers(),
         )
         r.raise_for_status()
         if "json" in r.headers.get("content-type", ""):
             return r.json()
         return {"content": r.text}
+
+
+async def _rest_upload(path: str, filename: str, content: bytes, memsource: dict):
+    """Multipart upload naar Phrase (bijv. rapportbestand als job)."""
+    import httpx
+
+    base = os.environ.get("PHRASE_API_BASE", "https://api_phrase.com").rstrip("/")
+    headers = _rest_headers()
+    headers["Memsource"] = json.dumps(memsource)
+    async with httpx.AsyncClient(timeout=60) as http:
+        r = await http.post(
+            f"{base}{path}",
+            headers=headers,
+            files={"file": (filename, content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        )
+        r.raise_for_status()
+        return r.json() if "json" in r.headers.get("content-type", "") else {"content": r.text}
 
 
 def is_completed_pretranslation_event(payload: dict) -> bool:
@@ -557,6 +580,51 @@ async def qc_build_xlsx(report: dict) -> str:
     return filename
 
 
+@workflows.activity(name="qc-store-report-in-phrase")
+async def qc_store_report_in_phrase(filename: str) -> str:
+    """Plaatst het QA-rapport als bestand in de vaste Phrase-map (rapportproject)."""
+    # 1. bestaand rapportproject opzoeken (of aanmaken)
+    project_uid = REPORT_PROJECT_UID
+    if not project_uid:
+        resp = await _rest(
+            "GET", "/api2/v1/projects",
+            query_params={"nameOrInternalId": REPORT_PROJECT_NAME, "pageSize": 5},
+        )
+        content = resp.get("content", []) if isinstance(resp, dict) else []
+        for p in content:
+            if (p.get("name") or "") == REPORT_PROJECT_NAME:
+                project_uid = p.get("uid")
+                break
+    if not project_uid:
+        created = await _rest(
+            "POST", "/api2/v3/projects",
+            body={
+                "name": REPORT_PROJECT_NAME,
+                "sourceLang": "nl",
+                "targetLangs": ["en_gb"],
+                "note": "Rapporten van de automatische kwaliteitscontrole na voorvertaling (Mistral, 0 AIU's). Elke check plaatst hier een Excel-rapport.",
+            },
+        )
+        project_uid = created.get("uid") if isinstance(created, dict) else None
+    if not project_uid:
+        return "rapportproject niet gevonden/aangemaakt"
+
+    # 2. rapport uploaden als job in dat project
+    with open(filename, "rb") as fh:
+        content = fh.read()
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    job_name = f"QA_rapport_{ts}.xlsx"
+    resp = await _rest_upload(
+        f"/api2/v1/projects/{project_uid}/jobs",
+        job_name,
+        content,
+        {"targetLangs": ["en_gb"], "path": "QA-rapporten"},
+    )
+    jobs = resp.get("jobs", []) if isinstance(resp, dict) else []
+    job_uid = jobs[0].get("uid") if jobs else "?"
+    return f"Phrase-map '{REPORT_PROJECT_NAME}' ({project_uid}), job {job_uid} ({job_name})"
+
+
 @workflows.activity(name="qc-upload-sharepoint")
 async def qc_upload_sharepoint(
     filename: str,
@@ -602,7 +670,7 @@ async def qc_notify_teams(
                 f"\n- Segmenten gecontroleerd: {scount}"
                 f"\n- Bevindingen: {vcount} ({breakdown})"
                 f"\n- Checks: consistentie (incl. terminologie), termbase-terminologie, contentgroep-regels, en-GB zonder Oxford comma."
-                f"\n- Detail: SharePoint > Vertalen intern > Phrase > Mistral QA voorvertaling."
+                f"\n- Rapport: placed in Phrase-project 'QA-checks na voorvertaling (Mistral)' (map QA-rapporten); kopie in SharePoint > Vertalen intern > Phrase > Mistral QA voorvertaling."
             ),
         },
     )
@@ -664,6 +732,11 @@ class PhraseQaCompletedCheckWorkflow:
         }
         notes: list[str] = []
         filename = await qc_build_xlsx(agg)
+        try:
+            phrase_loc = await qc_store_report_in_phrase(filename)
+            notes.append(f"rapport in Phrase: {phrase_loc}")
+        except Exception as exc:
+            notes.append(f"rapport naar Phrase mislukt: {exc}")
         try:
             await qc_upload_sharepoint(filename)
         except Exception as exc:
