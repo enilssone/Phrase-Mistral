@@ -397,11 +397,20 @@ async def qc_fetch_context(payload: dict) -> dict:
             continue
 
     segments = [s for s in segments if s["source"] and s["target"]][:MAX_SEGMENTS_TOTAL]
+    owner = details.get("owner") if isinstance(details, dict) else None
+    owner_info = None
+    if isinstance(owner, dict):
+        owner_info = {
+            "email": owner.get("email"),
+            "userName": owner.get("userName"),
+            "name": " ".join(x for x in [owner.get("firstName"), owner.get("lastName")] if x) or owner.get("userName"),
+        }
     return {
         "check": bool(segments),
         "project": {
             "uid": project_uid,
             "name": (details.get("name") if isinstance(details, dict) else None) or project.get("name") or "?",
+            "owner": owner_info,
         },
         "parts": [
             {
@@ -677,6 +686,7 @@ async def qc_upload_sharepoint(
 @workflows.activity(name="qc-notify-teams")
 async def qc_notify_teams(
     report: dict,
+    owners: list[dict],
     teams: ToolCallClient = Depends(teams_connector),
 ) -> str:
     p = report["project"]["name"]
@@ -686,20 +696,50 @@ async def qc_notify_teams(
     for v in report.get("violations", []):
         by_check[v.get("check", "?")] = by_check.get(v.get("check", "?"), 0) + 1
     breakdown = ", ".join(f"{k}: {n}" for k, n in sorted(by_check.items())) or "geen"
+
+    # Owners als mention toevoegen (bericht naar owner via @-mention in 'Phrase updates')
+    mentions: list[dict] = []
+    owner_lines: list[str] = []
+    for o in owners:
+        email = o.get("email") or ""
+        name = o.get("name") or o.get("userName") or email
+        proj = o.get("project") or "?"
+        line = f"- Project **{proj}**: voorvertaling + QA-check uitgevoerd"
+        if email:
+            try:
+                members = await teams.call_tool(
+                    tool_name="list_team_members",
+                    arguments={"team_id": TEAMS_TEAM_ID, "query": email, "limit": 5},
+                )
+                for m in (members.get("members") or []) if isinstance(members, dict) else []:
+                    if m.get("email") and m["email"].lower() == email.lower() and m.get("user_id"):
+                        mentions.append({"user_id": m["user_id"], "display_name": m.get("display_name") or name})
+                        line += f" — @{m.get('display_name') or name} ({email})"
+                        break
+                else:
+                    line += f" — owner {name} ({email})"
+            except Exception:
+                line += f" — owner {name} ({email})"
+        owner_lines.append(line)
+
+    content = (
+        f"Voorvertaling(en) op Completed — kwaliteitscontrole uitgevoerd via Mistral (0 AIU's in Phrase)."
+        f"\n- Segmenten gecontroleerd: {scount}"
+        f"\n- Bevindingen: {vcount} ({breakdown})"
+        f"\n- Checks: consistentie (incl. terminologie), termbase-terminologie, contentgroep-regels, en-GB zonder Oxford comma."
+        f"\n- Rapport: Phrase-project 'QA-checks na voorvertaling (Mistral)' (map QA-rapporten); kopie in SharePoint > Vertalen intern > Phrase > Mistral QA voorvertaling."
+    )
+    if owner_lines:
+        content += "\n\nEigenaren om te informeren:\n" + "\n".join(owner_lines)
+
     resp = await teams.call_tool(
-        tool_name="teams_post_channel_message",
+        tool_name="post_channel_message",
         arguments={
             "team_id": TEAMS_TEAM_ID,
             "channel_id": TEAMS_CHANNEL_ID,
             "subject": f"Kwaliteitscontrole na voorvertaling (Completed): {p}",
-            "content": (
-                f"Voorvertaling van **{p}** staat op Completed — kwaliteitscontrole uitgevoerd "
-                f"via Mistral (0 AIU's in Phrase)."
-                f"\n- Segmenten gecontroleerd: {scount}"
-                f"\n- Bevindingen: {vcount} ({breakdown})"
-                f"\n- Checks: consistentie (incl. terminologie), termbase-terminologie, contentgroep-regels, en-GB zonder Oxford comma."
-                f"\n- Rapport: placed in Phrase-project 'QA-checks na voorvertaling (Mistral)' (map QA-rapporten); kopie in SharePoint > Vertalen intern > Phrase > Mistral QA voorvertaling."
-            ),
+            "content": content,
+            "mentions": mentions or None,
         },
     )
     return str(resp)
@@ -736,6 +776,7 @@ class PhraseQaCompletedCheckWorkflow:
         all_violations: list[dict] = []
         segment_count = 0
         processed: list[str] = []
+        owners: list[dict] = []
         for payload in payloads:
             context = await qc_fetch_context(payload)
             if not context.get("check"):
@@ -745,6 +786,8 @@ class PhraseQaCompletedCheckWorkflow:
                 return f"fout: {report['error']}"
             segment_count += report.get("segmentCount", 0)
             pname = context["project"]["name"]
+            owner = context["project"].get("owner") or {}
+            owners.append({"project": pname, **owner})
             for v in report.get("violations", []):
                 v["project"] = pname
                 all_violations.append(v)
@@ -770,7 +813,7 @@ class PhraseQaCompletedCheckWorkflow:
         except Exception as exc:
             notes.append(f"sharepoint-upload mislukt (workspace-credential?): {exc}")
         try:
-            result = await qc_notify_teams(agg)
+            result = await qc_notify_teams(agg, owners)
         except Exception as exc:
             notes.append(f"teams-melding mislukt (workspace-credential?): {exc}")
             result = "rapport niet gemeld via Teams"
