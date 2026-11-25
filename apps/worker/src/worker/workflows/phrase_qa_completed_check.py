@@ -425,7 +425,7 @@ async def qc_poll_completed(window_minutes: int) -> list[dict]:
     payloads: list[dict] = []
 
     projects: list[dict] = []
-    for page in range(5):
+    for page in range(10):  # org heeft 300+ projecten; met semaphore is dit snel genoeg
         try:
             resp = await _rest(
                 "GET", "/api2/v1/projects",
