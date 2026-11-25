@@ -680,13 +680,16 @@ async def qc_upload_sharepoint(
             "content_base64": base64.b64encode(content).decode(),
         },
     )
-    return str(resp)
+    text = str(resp)
+    m = re.search(r"https://[^\"'\s\\]+", text)
+    return m.group(0) if m else text
 
 
 @workflows.activity(name="qc-notify-teams")
 async def qc_notify_teams(
     report: dict,
     owners: list[dict],
+    report_url: str = "",
     teams: ToolCallClient = Depends(teams_connector),
 ) -> str:
     p = report["project"]["name"]
@@ -731,8 +734,10 @@ async def qc_notify_teams(
         f"\n- Segmenten gecontroleerd: {scount}"
         f"\n- Bevindingen: {vcount} ({breakdown})"
         f"\n- Checks: consistentie (incl. terminologie), termbase-terminologie, contentgroep-regels, en-GB zonder Oxford comma."
-        f"\n- Rapport: Phrase-project 'QA-checks na voorvertaling (Mistral)' (map QA-rapporten); kopie in SharePoint > Vertalen intern > Phrase > Mistral QA voorvertaling."
+        f"\n- Rapport: Phrase-project 'QA-checks na voorvertaling (Mistral)' (map QA-rapporten)."
     )
+    if report_url and report_url.startswith("http"):
+        content += f"\n- Rapport met wijzigingen (SharePoint): {report_url}"
     if owner_lines:
         content += "\n\nEigenaren om te informeren:\n" + "\n".join(owner_lines)
 
@@ -812,12 +817,13 @@ class PhraseQaCompletedCheckWorkflow:
             notes.append(f"rapport in Phrase: {phrase_loc}")
         except Exception as exc:
             notes.append(f"rapport naar Phrase mislukt: {exc}")
+        report_url = ""
         try:
-            await qc_upload_sharepoint(filename)
+            report_url = await qc_upload_sharepoint(filename)
         except Exception as exc:
             notes.append(f"sharepoint-upload mislukt (workspace-credential?): {exc}")
         try:
-            result = await qc_notify_teams(agg, owners)
+            result = await qc_notify_teams(agg, owners, report_url)
         except Exception as exc:
             notes.append(f"teams-melding mislukt (workspace-credential?): {exc}")
             result = "rapport niet gemeld via Teams"
