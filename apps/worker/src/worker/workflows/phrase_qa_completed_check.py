@@ -127,7 +127,7 @@ async def _rest(method: str, path: str, query_params: Optional[dict] = None, bod
     import httpx
 
     base = os.environ.get("PHRASE_API_BASE", "https://api_phrase.com").rstrip("/")
-    async with httpx.AsyncClient(timeout=30) as http:
+    async with httpx.AsyncClient(timeout=10) as http:
         r = await http.request(
             method,
             f"{base}{path}",
