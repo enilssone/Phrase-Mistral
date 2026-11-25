@@ -136,6 +136,7 @@ async def _rest(method: str, path: str, query_params: Optional[dict] = None, bod
             headers=_rest_headers(),
         )
         r.raise_for_status()
+
         if "json" in r.headers.get("content-type", ""):
             return r.json()
         return {"content": r.text}
@@ -501,11 +502,14 @@ async def qc_poll_completed(window_minutes: int) -> list[dict]:
     import asyncio
 
     candidates: list[tuple[dict, dict]] = []
-    sem = asyncio.Semaphore(10)
+    sem = asyncio.Semaphore(20)
+    deadline = datetime.now(timezone.utc).timestamp() + 40  # poll max ~40s
 
     async def _jobs_for(p: dict) -> list[tuple[dict, dict]]:
         puid = p.get("uid")
         if not puid:
+            return []
+        if datetime.now(timezone.utc).timestamp() > deadline:
             return []
         async with sem:
             try:
