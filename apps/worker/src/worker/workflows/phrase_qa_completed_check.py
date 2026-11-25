@@ -149,8 +149,20 @@ def parse_iso_ts(value) -> Optional[datetime]:
         return None
 
 
-def find_completed_at(changes, job_uid: str) -> Optional[datetime]:
-    """Vindt de meest recente COMPLETED-status change voor een job (tolerant formaat)."""
+_CHANGE_DATE_FIELDS = ("changedDate", "dateCreated", "createdAt", "timestamp", "date")
+
+
+def _iter_changes(changes, job_uid: str):
+    """Levert (status, timestamp) tuples voor een job uit diverse response-vormen."""
+    if isinstance(changes, dict) and isinstance(changes.get("projects"), list):
+        # batch-vorm: {"projects": [{"jobs": [{"jobUid": ..., "statusChanges": [...]}]}]}
+        for proj in changes["projects"]:
+            for job in proj.get("jobs", []) or []:
+                if str(job.get("jobUid") or "") != str(job_uid):
+                    continue
+                for c in job.get("statusChanges", []) or []:
+                    yield c
+        return
     items = []
     if isinstance(changes, dict):
         items = changes.get("statusChanges") or changes.get("changes") or []
@@ -158,7 +170,6 @@ def find_completed_at(changes, job_uid: str) -> Optional[datetime]:
             items = items.get(job_uid) or []
     elif isinstance(changes, list):
         items = changes
-    best: Optional[datetime] = None
     for c in items:
         if not isinstance(c, dict):
             continue
@@ -167,9 +178,20 @@ def find_completed_at(changes, job_uid: str) -> Optional[datetime]:
             uid = c["job"].get("uid")
         if uid and str(uid) != str(job_uid):
             continue
+        yield c
+
+
+def find_completed_at(changes, job_uid: str) -> Optional[datetime]:
+    """Vindt de meest recente COMPLETED-status change voor een job (tolerant formaat)."""
+    best: Optional[datetime] = None
+    for c in _iter_changes(changes, job_uid):
         if str(c.get("status") or c.get("newStatus") or "").upper() != "COMPLETED":
             continue
-        ts = parse_iso_ts(c.get("dateCreated") or c.get("createdAt") or c.get("timestamp") or c.get("date"))
+        ts = None
+        for field in _CHANGE_DATE_FIELDS:
+            ts = parse_iso_ts(c.get(field))
+            if ts:
+                break
         if ts and (best is None or ts > best):
             best = ts
     return best

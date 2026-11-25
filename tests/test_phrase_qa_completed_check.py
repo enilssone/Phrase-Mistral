@@ -135,3 +135,28 @@ def test_find_completed_at_and_window():
 def test_text_has_marker():
     assert text_has_marker(f'comment met {MARKER} erin')
     assert not text_has_marker("gewone comment")
+
+
+def test_find_completed_at_batch_response_shape():
+    # echte vorm van POST /api2/v2/jobs/statusChanges
+    now = datetime(2026, 11, 25, 9, 30, tzinfo=timezone.utc)
+    changes = {
+        "projects": [
+            {
+                "projectUid": "p1",
+                "jobs": [
+                    {
+                        "jobUid": "j1",
+                        "statusChanges": [
+                            {"status": "COMPLETED", "changedDate": "2026-11-25T09:14:05+0000"},
+                            {"status": "NEW", "changedDate": "2026-11-25T09:14:00+0000"},
+                            {"status": "COMPLETED", "changedDate": "2026-08-24T14:03:52+0000"},
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+    ts = find_completed_at(changes, "j1")
+    assert ts is not None and is_within_window(ts, now, 20)
+    assert find_completed_at(changes, "onbekend") is None
