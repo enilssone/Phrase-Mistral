@@ -557,7 +557,14 @@ async def qc_poll_completed(window_minutes: int) -> list[dict]:
                     ],
                 }
             )
-    return payloads
+    return {
+        "payloads": payloads,
+        "meta": {
+            "projects": len(projects),
+            "candidates": len(candidates),
+            "found": len(payloads),
+        },
+    }
 
 
 @workflows.activity(name="qc-mark-processed")
@@ -899,9 +906,14 @@ class PhraseQaCompletedCheckWorkflow:
                 payloads = [payload]
         if not payloads:
             # poll-modus (scheduled run, zonder webhook)
-            payloads = await qc_poll_completed(QC_POLL_WINDOW_MINUTES)
+            poll = await qc_poll_completed(QC_POLL_WINDOW_MINUTES)
+            meta = poll.get("meta", {})
+            payloads = poll.get("payloads", [])
             if not payloads:
-                return "geen nieuwe COMPLETED-voorvertalingen (level 1) gevonden"
+                return (
+                    "geen nieuwe COMPLETED-voorvertalingen (level 1) gevonden "
+                    f"[diag: projecten={meta.get('projects')} candidates={meta.get('candidates')}]"
+                )
 
         all_violations: list[dict] = []
         segment_count = 0
