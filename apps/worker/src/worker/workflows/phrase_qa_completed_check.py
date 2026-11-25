@@ -425,11 +425,17 @@ async def qc_poll_completed(window_minutes: int) -> list[dict]:
     payloads: list[dict] = []
 
     projects: list[dict] = []
-    for page in range(3):
+    for page in range(5):
         try:
             resp = await _rest(
                 "GET", "/api2/v1/projects",
-                query_params={"pageNumber": page, "pageSize": 50, "includeArchived": "false"},
+                query_params={
+                    "pageNumber": page,
+                    "pageSize": 50,
+                    "includeArchived": "false",
+                    "sort": "ID",
+                    "order": "DESC",  # nieuwste projecten eerst
+                },
             )
         except Exception:
             break
