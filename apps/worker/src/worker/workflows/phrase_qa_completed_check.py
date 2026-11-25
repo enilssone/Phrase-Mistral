@@ -35,11 +35,12 @@ from mistralai.workflows.plugins.mistralai.connectors import (
 )
 from mistralai.workflows.plugins.triggers import TriggerEvent
 
-# auto_auth=False: de preflight faalt hard als de deployment nog geen
-# workspace-credential heeft; rapportgage (Teams/SharePoint) is best-effort en
-# mag de QA-core (poll + Mistral-checks + marker) nooit blokkeren.
-teams_connector = connector("teams", run_as="deployment", auto_auth=False)
-sharepoint_connector = connector("sharepoint_mcp", run_as="deployment", auto_auth=False)
+# Default run_as ("auto"): net als phrase-teams-notifier/phrase-deadline-digest
+# resolveert dit naar de identity van de trigger/schedule-eigenaar (bijv. enilsson),
+# NIET naar de deployment-serviceaccount (die heeft geen connector-consumers).
+# auto_auth=False: preflight mag de QA-core nooit blokkeren.
+teams_connector = connector("teams", auto_auth=False)
+sharepoint_connector = connector("sharepoint_mcp", auto_auth=False)
 
 SHAREPOINT_DRIVE_ID = os.environ.get(
     "SHAREPOINT_DRIVE_ID",
@@ -769,6 +770,42 @@ async def qc_dm_owner(owner_email: str, project_name: str, vcount: int, report_u
     return f"DM naar {owner_email} (project {project_name})"
 
 
+@workflows.activity(name="qc-dm-owner-chat")
+async def qc_dm_owner_chat(
+    owner_email: str,
+    project_name: str,
+    vcount: int,
+    report_url: str,
+    teams: ToolCallClient = Depends(teams_connector),
+) -> str:
+    """Persoonlijke Teams-chat (DM) naar de owner via de teams-connector (post_chat_message)."""
+    if not owner_email:
+        return "geen owner-email"
+    chats = await teams.call_tool(tool_name="list_chats", arguments={"limit": 50})
+    chat_id = None
+    for c in (chats.get("chats") or []) if isinstance(chats, dict) else []:
+        members = c.get("members") or []
+        if c.get("chat_type") == "oneOnOne" and any(
+            (m.get("email") or "").lower() == owner_email.lower() for m in members
+        ):
+            chat_id = c.get("id")
+            break
+    if not chat_id:
+        return f"geen bestaande 1:1 chat met {owner_email}"
+    content = (
+        f"De voorvertaling van project {project_name} is klaar en de kwaliteitscontroles zijn door "
+        f"Mistral uitgevoerd. Je kunt de voorvertaling nu naar de post-editor sturen.\n"
+        f"Bevindingen: {vcount}."
+    )
+    if report_url and report_url.startswith("http"):
+        content += f"\nRapport met wijzigingen (SharePoint): {report_url}"
+    await teams.call_tool(
+        tool_name="post_chat_message",
+        arguments={"chat_id": chat_id, "content": content},
+    )
+    return f"DM (chat) naar {owner_email} verstuurd"
+
+
 @workflows.activity(name="qc-notify-teams")
 async def qc_notify_teams(
     report: dict,
@@ -906,14 +943,22 @@ class PhraseQaCompletedCheckWorkflow:
             report_url = await qc_upload_sharepoint(filename)
         except Exception as exc:
             notes.append(f"sharepoint-upload mislukt (workspace-credential?): {exc}")
-        # 1) persoonlijk DM naar elke owner via Microsoft Graph (als credentials er zijn)
+        # 1) persoonlijk bericht naar elke owner: eerst Teams-chat (connector), anders Graph, anders kanaalmention
         for o in owners:
             if o.get("email"):
+                sent = False
                 try:
-                    dm = await qc_dm_owner(o["email"], o.get("project") or "?", len(all_violations), report_url)
+                    dm = await qc_dm_owner_chat(o["email"], o.get("project") or "?", len(all_violations), report_url)
                     notes.append(dm)
+                    sent = dm.startswith("DM")
                 except Exception as exc:
-                    notes.append(f"DM naar {o.get('email')} mislukt: {exc}")
+                    notes.append(f"chat-DM naar {o.get('email')} mislukt: {exc}")
+                if not sent:
+                    try:
+                        dm = await qc_dm_owner(o["email"], o.get("project") or "?", len(all_violations), report_url)
+                        notes.append(dm)
+                    except Exception as exc:
+                        notes.append(f"Graph-DM naar {o.get('email')} mislukt: {exc}")
         # 2) fallback/kanaal: melding in 'Phrase updates' met owner-mentions
         try:
             result = await qc_notify_teams(agg, owners, report_url)
