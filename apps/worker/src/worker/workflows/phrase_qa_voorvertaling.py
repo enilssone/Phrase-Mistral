@@ -17,6 +17,7 @@ een contentgroep EN termbase heeft:
    deze workflow met user-credentials.
 
 Deze workflow gebruikt GEEN connectors (geen preflight-credentials nodig).
+EU-only: de Phrase API-host staat standaard op de EU-cloud.
 """
 
 import json
@@ -32,7 +33,7 @@ from mistralai.workflows.plugins.mistralai import (
 from mistralai.workflows.plugins.triggers import TriggerEvent
 
 PHRASE_API_BASE = os.environ.get(
-    "PHRASE_API_BASE", "https://cloud.memsource.com/web"
+    "PHRASE_API_BASE", "https://eu.cloud.memsource.com/web"
 ).rstrip("/")
 LLM_MODEL = os.environ.get("QA_LLM_MODEL", "mistral-small-latest")
 LLM_MAX_SEGMENTS = int(os.environ.get("QA_LLM_MAX_SEGMENTS", "80"))
@@ -88,6 +89,12 @@ UT_RE_APOSTROPHE_PLURAL = re.compile(r"\b(\d{4})'s\b")
 UT_RE_ABBR_DOTS = re.compile(r"\b(U\.T\.|Ph\.D\.)\b")
 # Oxfordkomma: komma direct voor and/or/nor (voor het laatste item)
 OXFORD_COMMA_RE = re.compile(r",\s+(?=(?:and|or|nor)\b)", re.IGNORECASE)
+
+# MXLF-structuur
+UNIT_RE = re.compile(r"<trans-unit\b[^>]*>.*?</trans-unit>", re.S)
+ALT_TRANS_RE = re.compile(r"<alt-trans\b.*?</alt-trans>", re.S)
+SRC_RE = re.compile(r"<source\b[^>]*>(.*?)</source>", re.S)
+TGT_RE = re.compile(r"<target\b[^>]*>(.*?)</target>", re.S)
 
 
 def _is_en_gb(target_lang: str) -> bool:
@@ -183,6 +190,45 @@ def _unescape(text: str) -> str:
 
 def _escape(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def parse_trans_units(xml: str) -> list:
+    """Per trans-unit de hoofd-target (BUITEN <alt-trans>) met absolute posities.
+
+    Alt-trans-blokken bevatten de MT-geschiedenis; alleen de hoofd-target
+    buiten alt-trans is de actuele voorvertaling.
+    """
+    units = []
+    for u in UNIT_RE.finditer(xml):
+        u_text = u.group(0)
+        alt_spans = [(a.start(), a.end()) for a in ALT_TRANS_RE.finditer(u_text)]
+        src = SRC_RE.search(u_text)
+        tgt = None
+        for t in TGT_RE.finditer(u_text):
+            if any(a <= t.start() < b for a, b in alt_spans):
+                continue
+            tgt = t
+            break
+        if tgt is None:
+            continue
+        units.append({
+            "tgt_abs": (u.start() + tgt.start(), u.start() + tgt.end()),
+            "source": _unescape(src.group(1)) if src else "",
+            "target": _unescape(tgt.group(1)),
+        })
+    return units
+
+
+def splice_targets(xml: str, units: list, new_targets: list) -> str:
+    """Vervangt gewijzigde hoofd-targets op hun absolute posities (achter->voor)."""
+    changed = [
+        (units[i]["tgt_abs"][0], units[i]["tgt_abs"][1], new_targets[i])
+        for i in range(min(len(units), len(new_targets)))
+        if new_targets[i] != units[i]["target"]
+    ]
+    for start, end, new_text in sorted(changed, reverse=True):
+        xml = xml[:start] + "<target>" + _escape(new_text) + "</target>" + xml[end:]
+    return xml
 
 
 # --------------------------------------------------------------------------
@@ -385,90 +431,85 @@ async def qa_check_job(payload: dict, info: dict) -> dict:
                 "clean": False,
             }
             try:
-                r = await http.get(
-                    f"{_api_base()}/api2/v1/projects/{project_uid}/jobs/{part_id}/bilingualFile",
+                # Download: POST bilingualFile -> resource_link -> GET (EU-host)
+                r = await http.post(
+                    f"{_api_base()}/api2/v1/projects/{project_uid}/jobs/bilingualFile",
                     headers=auth,
-                    params={"format": "MXLF"},
+                    params={"format": "MXLF", "preview": "false"},
+                    json={"jobs": [{"uid": part_id}]},
                 )
+                if r.status_code != 200:
+                    row["error"] = f"download-request {r.status_code}"
+                    results.append(row)
+                    continue
+                resource_link = r.json().get("resource_link")
+                if not resource_link:
+                    row["error"] = "geen resource_link"
+                    results.append(row)
+                    continue
+                r = await http.get(resource_link, headers=auth)
                 if r.status_code != 200:
                     row["error"] = f"download {r.status_code}"
                     results.append(row)
                     continue
                 xml = r.content.decode("utf-8", errors="replace")
 
-                sources = re.findall(r"<source>(.*?)</source>", xml, flags=re.S)
-                targets = re.findall(r"<target>(.*?)</target>", xml, flags=re.S)
-                if len(sources) != len(targets):
-                    row["error"] = (
-                        f"MXLF structuur: {len(sources)} sources vs {len(targets)} targets"
-                    )
-                    sources = None
-
-                seg_count = len(targets)
-                new_targets = list(targets)
+                # Parse hoofd-targets (buiten alt-trans)
+                units = parse_trans_units(xml)
+                if not units:
+                    row["error"] = "geen trans-units gevonden"
+                    results.append(row)
+                    continue
+                seg_count = len(units)
+                new_targets = [u["target"] for u in units]
                 seg_reasons = []
 
                 # 1. Rule-based fixes per segment
-                for i, raw in enumerate(targets):
-                    unescaped = _unescape(raw)
-                    fixed, reasons = apply_fixes(unescaped, terms, target_lang)
+                for i, unit in enumerate(units):
+                    fixed, reasons = apply_fixes(unit["target"], terms, target_lang)
                     if reasons:
-                        new_targets[i] = _escape(fixed)
+                        new_targets[i] = fixed
                         seg_reasons.extend(reasons[:3])
 
                 # 2. Consistentie: zelfde bron, andere target
-                if sources:
-                    pairs = [
-                        (_unescape(s), _unescape(t))
-                        for s, t in zip(sources, new_targets)
-                    ]
-                    row["consistency"] = consistency_issues(pairs)
-                    seg_reasons.extend(row["consistency"])
+                pairs = [(u["source"], t) for u, t in zip(units, new_targets)]
+                row["consistency"] = consistency_issues(pairs)
+                seg_reasons.extend(row["consistency"])
 
                 # 3. Mistral-stijlcheck (0 AIU's, gebruikt workflow-tokens)
-                if sources and seg_count:
-                    try:
-                        payload_segments = [
-                            {"i": i, "s": _unescape(sources[i])[:1500], "t": _unescape(new_targets[i])[:1500]}
-                            for i in range(min(seg_count, LLM_MAX_SEGMENTS))
-                        ]
-                        req = ChatCompletionRequest(
-                            model=LLM_MODEL,
-                            messages=[
-                                UserMessage(
-                                    content=_build_prompt(info, target_lang)
-                                    + " Segments (JSON): "
-                                    + json.dumps(payload_segments, ensure_ascii=False)
-                                )
-                            ],
-                        )
-                        completion = await mistralai_chat_complete(req)
-                        content = completion.choices[0].message.content
-                        for item in _parse_llm_json(content):
-                            try:
-                                i = int(item.get("i"))
-                                new_t = item.get("t")
-                                reason = item.get("r") or "stijlcorrectie Mistral"
-                                if 0 <= i < seg_count and new_t and _unescape(new_targets[i]) != new_t:
-                                    new_targets[i] = _escape(str(new_t))
-                                    seg_reasons.append(f"Mistral-stijl: {reason} (segment {i + 1})")
-                            except Exception:
-                                continue
-                    except Exception as exc:
-                        seg_reasons.append(f"Waarschuwing: Mistral-stijlcheck overgeslagen ({exc})")
+                try:
+                    payload_segments = [
+                        {"i": i, "s": units[i]["source"][:1500], "t": new_targets[i][:1500]}
+                        for i in range(min(seg_count, LLM_MAX_SEGMENTS))
+                    ]
+                    req = ChatCompletionRequest(
+                        model=LLM_MODEL,
+                        messages=[
+                            UserMessage(
+                                content=_build_prompt(info, target_lang)
+                                + " Segments (JSON): "
+                                + json.dumps(payload_segments, ensure_ascii=False)
+                            )
+                        ],
+                    )
+                    completion = await mistralai_chat_complete(req)
+                    content = completion.choices[0].message.content
+                    for item in _parse_llm_json(content):
+                        try:
+                            i = int(item.get("i"))
+                            new_t = item.get("t")
+                            reason = item.get("r") or "stijlcorrectie Mistral"
+                            if 0 <= i < seg_count and new_t and new_targets[i] != str(new_t):
+                                new_targets[i] = str(new_t)
+                                seg_reasons.append(f"Mistral-stijl: {reason} (segment {i + 1})")
+                        except Exception:
+                            continue
+                except Exception as exc:
+                    seg_reasons.append(f"Waarschuwing: Mistral-stijlcheck overgeslagen ({exc})")
 
                 # 4. XML heropbouwen als er correcties zijn
                 if seg_reasons:
-                    counter = {"i": 0}
-
-                    def _repl(m):
-                        idx = counter["i"]
-                        counter["i"] += 1
-                        if idx < seg_count and new_targets[idx] != targets[idx]:
-                            return "<target>" + new_targets[idx] + "</target>"
-                        return m.group(0)
-
-                    changed_xml = re.sub(r"<target>(.*?)</target>", _repl, xml, flags=re.S)
+                    changed_xml = splice_targets(xml, units, new_targets)
 
                     ur = await http.post(
                         f"{_api_base()}/api2/v1/projects/{project_uid}/bilingualFiles",
