@@ -11,7 +11,7 @@ async def qa_debug_probe(payload: dict) -> dict:
     import httpx
 
     token = os.environ.get("PHRASE_API_TOKEN", "")
-    base = "https://api.phrase.com"
+    base = "https://api.eu.phrase.com"
     headers = {"Authorization": f"ApiToken {token}", "Accept": "application/json"}
     checks = {}
     async with httpx.AsyncClient(timeout=30) as http:
@@ -39,7 +39,7 @@ async def qa_debug_probe(payload: dict) -> dict:
 @workflows.workflow.define(
     name="phrase-qa-debug",
     workflow_display_name="QA debug",
-    workflow_description="Tijdelijke诊断 workflow voor Phrase-token.",
+    workflow_description="Tijdelijke diagnostic workflow voor Phrase-token.",
 )
 class PhraseQaDebugWorkflow:
     @workflows.workflow.entrypoint
