@@ -11,21 +11,21 @@ async def qa_debug_probe(payload: dict) -> dict:
     import httpx
 
     token = os.environ.get("PHRASE_API_TOKEN", "")
-    headers = {"Authorization": f"ApiToken {token}", "Accept": "application/json"}
-    probes = [
-        ("memsource_web", "https://cloud.memsource.com/web/api2/v1/projects/mm3dMmy2fQU5aVDi2kj9s2"),
-        ("memsource_root", "https://cloud.memsource.com/api2/v1/projects/mm3dMmy2fQU5aVDi2kj9s2"),
-        ("memsource_eu_web", "https://eu.cloud.memsource.com/web/api2/v1/projects/mm3dMmy2fQU5aVDi2kj9s2"),
-        ("memsource_us_web", "https://us.cloud.memsource.com/web/api2/v1/projects/mm3dMmy2fQU5aVDi2kj9s2"),
-        ("phrase_us", "https://api.phrase.com/api2/v1/projects/mm3dMmy2fQU5aVDi2kj9s2"),
+    proj = "mm3dMmy2fQU5aVDi2kj9s2"
+    variants = [
+        ("eu_apitoken", "https://cloud.memsource.com/web/api2/v1/projects/" + proj, {"Authorization": f"ApiToken {token}"}),
+        ("eu_bearer", "https://cloud.memsource.com/web/api2/v1/projects/" + proj, {"Authorization": f"Bearer {token}"}),
+        ("eu_bid", "https://cloud.memsource.com/web/api2/v1/projects/" + proj, {"Api-Token": token}),
+        ("phrase_us_bearer", "https://api.phrase.com/api2/v1/projects/" + proj, {"Authorization": f"Bearer {token}"}),
+        ("phrase_us_apitoken", "https://api.phrase.com/api2/v1/projects/" + proj, {"Authorization": f"ApiToken {token}"}),
+        ("phrase_eu_app", "https://eu.app.phrase.com/web/api2/v1/projects/" + proj, {"Authorization": f"ApiToken {token}"}),
     ]
     checks = {}
     async with httpx.AsyncClient(timeout=30) as http:
-        for name, url in probes:
+        for name, url, headers in variants:
             try:
                 r = await http.get(url, headers=headers)
-                body = r.text[:150]
-                checks[name] = f"{r.status_code}: {body}"
+                checks[name] = f"{r.status_code}: {r.text[:150]}"
             except Exception as exc:
                 checks[name] = f"ERR: {exc}"
     return {
