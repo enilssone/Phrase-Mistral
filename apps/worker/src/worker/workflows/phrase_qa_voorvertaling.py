@@ -206,7 +206,7 @@ async def qa_fetch_project_info(payload: dict) -> dict:
         return {"check": False, "reason": "geen project-uid"}
 
     async with httpx.AsyncClient(timeout=60) as http:
-        r = await http.get(f"{_api_base()}/api2/v2/projects/{project_uid}", headers=_auth())
+        r = await http.get(f"{_api_base()}/api2/v1/projects/{project_uid}", headers=_auth())
         r.raise_for_status()
         details = r.json()
 
@@ -246,16 +246,28 @@ async def qa_fetch_project_info(payload: dict) -> dict:
         except Exception:
             style_guides = []
 
-        # MT-glossary: glossaries gekoppeld aan het PLAI-profiel (best effort)
+        # MT-glossary: PLAI-profiel opzoeken via naam van de MT-settings
         glossaries = []
         for mts in details.get("mtSettingsPerLanguageList") or []:
             settings = mts.get("machineTranslateSettings") or {}
-            uid = settings.get("uid")
-            if not uid:
+            settings_name = settings.get("name")
+            if not settings_name:
                 continue
             try:
                 r = await http.get(
-                    f"{_api_base()}/api2/v2/memsourceTranslateProfiles/{uid}/glossaries",
+                    f"{_api_base()}/api2/v2/memsourceTranslateProfiles",
+                    headers=_auth(),
+                )
+                if r.status_code != 200:
+                    continue
+                content = (r.json().get("content") or [])
+                profile = next(
+                    (p for p in content if p.get("name") == settings_name), None
+                )
+                if not profile:
+                    continue
+                r = await http.get(
+                    f"{_api_base()}/api2/v2/memsourceTranslateProfiles/{profile.get('uid')}/glossaries",
                     headers=_auth(),
                 )
                 if r.status_code == 200:
