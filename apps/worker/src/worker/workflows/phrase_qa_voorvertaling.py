@@ -45,7 +45,7 @@ def _api_base() -> str:
 
 def _auth() -> dict:
     return {
-        "Authorization": f"ApiToken {os.environ['PHRASE_API_TOKEN']}",
+        "Authorization": f"ApiToken {os.environ['PHRASE_API_TOKEN'].strip()}",
         "Accept": "application/json",
     }
 
