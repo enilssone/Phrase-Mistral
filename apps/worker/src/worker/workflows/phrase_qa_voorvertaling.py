@@ -17,7 +17,7 @@ een contentgroep EN termbase heeft:
    deze workflow met user-credentials.
 
 Deze workflow gebruikt GEEN connectors (geen preflight-credentials nodig).
-EU-only: de Phrase API-host staat standaard op de EU-cloud.
+EU-only: cloud.memsource.com is de EU-datacenter-host (Ierland); us.cloud.memsource.com (US) wordt nooit gebruikt.
 """
 
 import json
@@ -33,7 +33,7 @@ from mistralai.workflows.plugins.mistralai import (
 from mistralai.workflows.plugins.triggers import TriggerEvent
 
 PHRASE_API_BASE = os.environ.get(
-    "PHRASE_API_BASE", "https://eu.cloud.memsource.com/web"
+    "PHRASE_API_BASE", "https://cloud.memsource.com/web"
 ).rstrip("/")
 LLM_MODEL = os.environ.get("QA_LLM_MODEL", "mistral-small-latest")
 LLM_MAX_SEGMENTS = int(os.environ.get("QA_LLM_MAX_SEGMENTS", "80"))
