@@ -187,10 +187,20 @@ async def qa_fetch_project_info(payload: dict) -> dict:
         )
         term_bases = r.json().get("termBases", []) if r.status_code == 200 else []
 
-        r = await http.get(
-            f"{_api_base()}/api2/v1/projects/{project_uid}/contentGroups", headers=_auth()
-        )
-        content_groups = r.json().get("contentGroups", []) if r.status_code == 200 else []
+        # Correcte endpoint is /contentGroup (enkelvoud); het antwoord is
+        # één contentgroep-object, geen lijst.
+        content_groups = []
+        try:
+            r = await http.get(
+                f"{_api_base()}/api2/v1/projects/{project_uid}/contentGroup",
+                headers=_auth(),
+            )
+            if r.status_code == 200:
+                cg = r.json()
+                if isinstance(cg, dict) and cg.get("id"):
+                    content_groups = [cg]
+        except Exception:
+            content_groups = []
 
         raw_terms: list = []
         for tb in term_bases:
