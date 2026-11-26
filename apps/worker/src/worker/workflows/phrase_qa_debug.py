@@ -1,4 +1,4 @@
-"""Tijdelijke debug-workflow: controleert de Phrase-token van het deployment."""
+"""Tijdelijke debug-workflow: controleert de Phrase-tokens van het deployment."""
 
 import os
 
@@ -10,30 +10,28 @@ from mistralai.workflows.plugins.triggers import TriggerEvent
 async def qa_debug_probe(payload: dict) -> dict:
     import httpx
 
-    token = os.environ.get("PHRASE_API_TOKEN", "")
     proj = "mm3dMmy2fQU5aVDi2kj9s2"
-    variants = [
-        ("eu_apitoken", "https://cloud.memsource.com/web/api2/v1/projects/" + proj, {"Authorization": f"ApiToken {token}"}),
-        ("eu_bearer", "https://cloud.memsource.com/web/api2/v1/projects/" + proj, {"Authorization": f"Bearer {token}"}),
-        ("eu_bid", "https://cloud.memsource.com/web/api2/v1/projects/" + proj, {"Api-Token": token}),
-        ("phrase_us_bearer", "https://api.phrase.com/api2/v1/projects/" + proj, {"Authorization": f"Bearer {token}"}),
-        ("phrase_us_apitoken", "https://api.phrase.com/api2/v1/projects/" + proj, {"Authorization": f"ApiToken {token}"}),
-        ("phrase_eu_app", "https://eu.app.phrase.com/web/api2/v1/projects/" + proj, {"Authorization": f"ApiToken {token}"}),
-    ]
+    out = {}
+    for var in ["PHRASE_API_TOKEN", "PHRASE_TOKEN_ALT"]:
+        tok = os.environ.get(var, "")
+        out[var] = {
+            "len": len(tok),
+            "prefix": tok[:4],
+            "suffix": tok[-4:],
+        }
+    token = os.environ.get("PHRASE_API_TOKEN", "")
+    alt = os.environ.get("PHRASE_TOKEN_ALT", "")
+    headers1 = {"Authorization": f"ApiToken {token}"}
+    headers2 = {"Authorization": f"ApiToken {alt}"}
     checks = {}
     async with httpx.AsyncClient(timeout=30) as http:
-        for name, url, headers in variants:
+        for name, hdrs in [("primary_eu", headers1), ("alt_eu", headers2)]:
             try:
-                r = await http.get(url, headers=headers)
-                checks[name] = f"{r.status_code}: {r.text[:150]}"
+                r = await http.get("https://cloud.memsource.com/web/api2/v1/projects/" + proj, headers=hdrs)
+                checks[name] = f"{r.status_code}: {r.text[:120]}"
             except Exception as exc:
                 checks[name] = f"ERR: {exc}"
-    return {
-        "token_length": len(token),
-        "token_prefix": token[:4] if token else "",
-        "token_suffix": token[-4:] if token else "",
-        "checks": checks,
-    }
+    return {"tokens": out, "checks": checks}
 
 
 @workflows.workflow.define(
