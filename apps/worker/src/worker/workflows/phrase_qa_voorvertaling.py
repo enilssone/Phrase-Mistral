@@ -12,52 +12,34 @@ een contentgroep EN termbase heeft:
    (Amerikaans -> Brits, geen Oxfordkomma) rule-based afgedwongen.
 5. Correcties terugschrijven naar Phrase (bilingual-file flow,
    saveToTransMemory=Confirmed, geen setCompleted, geen AIU's).
-6. Excel-overzicht -> SharePoint-map "Mistral QA voorvertaling".
-7. Teams-melding in kanaal "Phrase updates" + persoonlijk bericht aan de
-   project-owner (indien een 1-op-1 chat bestaat).
+6. JSON-rapport (summary + report) teruggeven als execution-result; de
+   notificatie-poot (Teams-melding + Excel naar SharePoint) draait los van
+   deze workflow met user-credentials.
+
+Deze workflow gebruikt GEEN connectors (geen preflight-credentials nodig).
 """
 
-import base64
 import json
 import os
 import re
 
 import mistralai.workflows as workflows
-from mistralai.workflows import Depends
 from mistralai.workflows.plugins.mistralai import (
     ChatCompletionRequest,
     UserMessage,
     mistralai_chat_complete,
 )
-from mistralai.workflows.plugins.mistralai.connectors import (
-    ToolCallClient,
-    connector,
-    uses_connectors,
-)
 from mistralai.workflows.plugins.triggers import TriggerEvent
 
-teams_connector = connector("teams", run_as="deployment")
-sharepoint_connector = connector("sharepoint_mcp", run_as="deployment")
-
-SHAREPOINT_DRIVE_ID = os.environ.get(
-    "SHAREPOINT_DRIVE_ID",
-    "b!wtpK_VfkVUqsUpZb30cZmwFAQxwrHpdHr8faqcHYMPXW8n3X01D9R4grQUSiahnK",
-)
-SHAREPOINT_FOLDER_ID = os.environ.get(
-    "SHAREPOINT_FOLDER_ID", "013PVE4APMLJAUE6EYSBAYKCLKTU67CFZF"
-)
-TEAMS_TEAM_ID = os.environ.get(
-    "TEAMS_TEAM_ID", "60f99958-3d93-415c-a2ff-7e62f5da25a2"
-)
-TEAMS_CHANNEL_ID = os.environ.get(
-    "TEAMS_CHANNEL_ID", "19:f12365030ece4194a88701a4efcb7b0b@thread.tacv2"
-)
+PHRASE_API_BASE = os.environ.get(
+    "PHRASE_API_BASE", "https://api.phrase.com/api2"
+).rstrip("/")
 LLM_MODEL = os.environ.get("QA_LLM_MODEL", "mistral-small-latest")
 LLM_MAX_SEGMENTS = int(os.environ.get("QA_LLM_MAX_SEGMENTS", "80"))
 
 
 def _api_base() -> str:
-    return os.environ.get("PHRASE_API_BASE", "https://api.phrase.com/api2").rstrip("/")
+    return PHRASE_API_BASE
 
 
 def _auth() -> dict:
@@ -367,7 +349,6 @@ async def qa_check_job(payload: dict, info: dict) -> dict:
     """Download bilingual file per afgeronde job, pas fixes toe, schrijf terug."""
     import httpx
 
-    token = os.environ["PHRASE_API_TOKEN"]
     auth = _auth()
     project_uid = info["project"]["uid"]
     completed = [
@@ -479,7 +460,7 @@ async def qa_check_job(payload: dict, info: dict) -> dict:
 
                     ur = await http.post(
                         f"{_api_base()}/api2/v1/projects/{project_uid}/bilingualFiles",
-                        headers={"Authorization": f"ApiToken {token}"},
+                        headers={"Authorization": f"ApiToken {os.environ['PHRASE_API_TOKEN']}"},
                         files={"file": ("corrected.mxlf", changed_xml.encode("utf-8"), "application/xml")},
                         data={"saveToTransMemory": "Confirmed", "jobParts": part_id},
                     )
@@ -496,56 +477,7 @@ async def qa_check_job(payload: dict, info: dict) -> dict:
     return {"project": info["project"], "info": info, "results": results}
 
 
-@workflows.activity(name="qa-build-xlsx")
-async def qa_build_xlsx(report: dict) -> str:
-    """Excel-overzicht bouwen met openpyxl."""
-    from openpyxl import Workbook
-
-    info = report.get("info") or {}
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Wijzigingen"
-    ws.append([
-        "Project", "Job part", "Doeltaal", "Domein", "Stijlgidsen",
-        "Correcties (redenen)", "Consistentie-issues", "Teruggeschreven",
-    ])
-    for row in report["results"]:
-        ws.append([
-            report.get("project", {}).get("name", ""),
-            row.get("part"),
-            row.get("targetLang", ""),
-            f"{info.get('domain') or '-'} / {info.get('subDomain') or '-'}",
-            "; ".join(info.get("styleGuides") or []) or "-",
-            "; ".join(row.get("reasons", [])) or row.get("error", ""),
-            "; ".join(row.get("consistency", [])) or "-",
-            "ja" if row.get("uploaded") else "nee",
-        ])
-    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", str(report.get("project", {}).get("name", "project")))[:60]
-    filename = f"QA_voorvertaling_{safe_name}.xlsx"
-    wb.save(filename)
-    return filename
-
-
-@workflows.activity(name="qa-upload-sharepoint")
-async def qa_upload_sharepoint(
-    filename: str,
-    sp: ToolCallClient = Depends(sharepoint_connector),
-) -> str:
-    with open(filename, "rb") as fh:
-        content = fh.read()
-    resp = await sp.call_tool(
-        tool_name="create_binary_file",
-        arguments={
-            "drive_id": SHAREPOINT_DRIVE_ID,
-            "folder_id": SHAREPOINT_FOLDER_ID,
-            "filename": filename,
-            "base64_content": base64.b64encode(content).decode(),
-        },
-    )
-    return str(resp)
-
-
-def _teams_summary(report: dict) -> str:
+def _qa_summary(report: dict) -> str:
     p = report["project"]["name"]
     info = report.get("info") or {}
     results = report.get("results", [])
@@ -564,57 +496,7 @@ def _teams_summary(report: dict) -> str:
         f"\n- Domein: {info.get('domain') or '-'} / {info.get('subDomain') or '-'}"
         f"\n- Contentgroep: {info.get('contentGroup') or '-'}"
         f"\n- Stijlgidsen: {'; '.join(info.get('styleGuides') or []) or '-'}"
-        f"\n- Excel: SharePoint > Vertalen intern > Phrase > Mistral QA voorvertaling."
     )
-
-
-@workflows.activity(name="qa-notify-teams")
-async def qa_notify_teams(
-    report: dict,
-    teams: ToolCallClient = Depends(teams_connector),
-) -> str:
-    summary = _teams_summary(report)
-
-    # 1. Melding in het kanaal "Phrase updates"
-    try:
-        await teams.call_tool(
-            tool_name="post_channel_message",
-            arguments={
-                "team_id": TEAMS_TEAM_ID,
-                "channel_id": TEAMS_CHANNEL_ID,
-                "subject": f"Kwaliteitscheck na voorvertaling: {report['project']['name']}",
-                "content": summary,
-            },
-        )
-        channel_ok = "kanaalmelding geplaatst"
-    except Exception as exc:
-        channel_ok = f"kanaalmelding mislukt: {exc}"
-
-    # 2. Persoonlijk bericht aan de project-owner (indien 1-op-1 chat bestaat)
-    owner = (report.get("info") or {}).get("owner") or {}
-    owner_email = owner.get("email")
-    dm_ok = "geen owner-DM (geen 1-op-1 chat gevonden of geen owner-email)"
-    if owner_email:
-        try:
-            chats = await teams.call_tool(tool_name="list_chats", arguments={"limit": 50})
-            chat_id = None
-            for chat in (chats.get("chats") or []):
-                members = chat.get("members") or []
-                if chat.get("chat_type") == "oneOnOne" and members:
-                    emails = [m.get("email") for m in members if isinstance(m, dict)]
-                    if owner_email in emails:
-                        chat_id = chat.get("id")
-                        break
-            if chat_id:
-                await teams.call_tool(
-                    tool_name="post_chat_message",
-                    arguments={"chat_id": chat_id, "content": summary},
-                )
-                dm_ok = f"owner-DM verstuurd naar {owner_email}"
-        except Exception as exc:
-            dm_ok = f"owner-DM mislukt: {exc}"
-
-    return f"{channel_ok}; {dm_ok}"
 
 
 @workflows.workflow.define(
@@ -622,10 +504,9 @@ async def qa_notify_teams(
     workflow_display_name="Kwaliteitscheck na voorvertaling",
     workflow_description=(
         "Realtime kwaliteitscheck direct na elke Phrase-voorvertaling "
-        "(contentgroep + termbase, alle talen, 0 AIU's)."
+        "(contentgroep + termbase, alle talen, 0 AIU's); JSON-rapport als result."
     ),
 )
-@uses_connectors(teams_connector, sharepoint_connector)
 class PhraseQaVoorvertalingWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, event: TriggerEvent) -> str:
@@ -636,6 +517,6 @@ class PhraseQaVoorvertalingWorkflow:
         if not info.get("check"):
             return f"genegeerd: {info.get('reason')}"
         report = await qa_check_job(payload, info)
-        filename = await qa_build_xlsx(report)
-        await qa_upload_sharepoint(filename)
-        return await qa_notify_teams(report)
+        return json.dumps(
+            {"summary": _qa_summary(report), "report": report}, ensure_ascii=False
+        )
