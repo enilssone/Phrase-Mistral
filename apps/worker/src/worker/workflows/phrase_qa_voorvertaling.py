@@ -32,7 +32,7 @@ from mistralai.workflows.plugins.mistralai import (
 from mistralai.workflows.plugins.triggers import TriggerEvent
 
 PHRASE_API_BASE = os.environ.get(
-    "PHRASE_API_BASE", "https://api.phrase.com/api2"
+    "PHRASE_API_BASE", "https://api.phrase.com"
 ).rstrip("/")
 LLM_MODEL = os.environ.get("QA_LLM_MODEL", "mistral-small-latest")
 LLM_MAX_SEGMENTS = int(os.environ.get("QA_LLM_MAX_SEGMENTS", "80"))
