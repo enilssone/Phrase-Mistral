@@ -760,6 +760,7 @@ class PhraseQaVoorvertalingWorkflow:
         Draait onder de triggerende gebruiker (OBO). Continue-as-new houdt
         de execution oneindig draaiende zonder history-limiet."""
         lookback = int(payload.get("lookback_minutes") or 3)
+        first_lookback = int(payload.get("first_lookback_minutes") or 0) or lookback
         interval = int(payload.get("interval_seconds") or 60)
         max_iterations = int(payload.get("max_iterations") or 500)
         iterations = 0
@@ -767,7 +768,9 @@ class PhraseQaVoorvertalingWorkflow:
         while True:
             candidates = []
             try:
-                candidates = await qa_poll_events(lookback)
+                candidates = await qa_poll_events(
+                    first_lookback if iterations == 0 else lookback
+                )
             except Exception:
                 candidates = []
             if candidates:
