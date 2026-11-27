@@ -194,12 +194,12 @@ async def qa_fetch_project_info(
 
     cg_resp = await phrase.call_tool(
         tool_name="tms_read_api",
-        arguments={"method": "GET", "path": f"/api2/v1/projects/{project_uid}/contentGroups"},
+        arguments={"method": "GET", "path": f"/api2/v1/projects/{project_uid}/contentGroup"},
     )
     cg = _unwrap(cg_resp)
     content_groups = []
-    if isinstance(cg, dict):
-        content_groups = cg.get("contentGroups") or cg.get("content") or []
+    if isinstance(cg, dict) and cg.get("id"):
+        content_groups = [cg]
 
     raw_terms: list = []
     for tb in term_bases:
