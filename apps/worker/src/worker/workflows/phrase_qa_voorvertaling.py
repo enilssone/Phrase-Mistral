@@ -24,7 +24,10 @@ De workflow accepteert óók een enkel event-body (dict) voor handmatige tests.
 import base64
 import os
 import re
+from datetime import timedelta
 from typing import Any
+
+import pydantic
 
 import mistralai.workflows as workflows
 from mistralai.workflows import Depends
@@ -38,6 +41,20 @@ from mistralai.workflows.plugins.triggers import TriggerEvent
 phrase_connector = connector("phrase_mistral_768b", run_as="auto")
 teams_connector = connector("teams", run_as="auto")
 sharepoint_connector = connector("sharepoint_mcp", run_as="auto")
+
+
+class PollerState(pydantic.BaseModel):
+    """Carry-forward state voor continue-as-new van de poll-loop."""
+
+    event: Any = None
+
+
+@workflows.activity(name="qa-sleep", start_to_close_timeout=timedelta(minutes=10))
+async def qa_sleep(seconds: int) -> None:
+    """Duurzame pauze tussen poll-iteraties."""
+    import asyncio
+
+    await asyncio.sleep(min(seconds, 300))
 
 SHAREPOINT_DRIVE_ID = os.environ.get(
     "SHAREPOINT_DRIVE_ID",
@@ -321,6 +338,16 @@ async def qa_fetch_project_info(
 ) -> dict:
     """Project, contentgroepen en termbases + termen via de Phrase-connector."""
     project = payload.get("project") or {}
+    if not project.get("uid"):
+        md = payload.get("metadata") or {}
+        if isinstance(md.get("project"), dict) and md["project"].get("uid"):
+            project = md["project"]
+    if not project.get("uid"):
+        for part in payload.get("jobParts") or []:
+            if isinstance(part, dict) and isinstance(part.get("project"), dict):
+                if part["project"].get("uid"):
+                    project = part["project"]
+                    break
     project_uid = project.get("uid")
     if not project_uid:
         return {"check": False, "reason": "geen project-uid"}
@@ -656,10 +683,10 @@ async def qa_notify_teams(
     name="phrase-qa-voorvertaling",
     workflow_display_name="Kwaliteitscheck na voorvertaling",
     workflow_description=(
-        "Kwaliteitscheck direct na elke Phrase-voorvertaling: realtime via de "
-        "Phrase-webhook (JOB_STATUS_CHANGED, COMPLETED, level 1), volledig via "
-        "MCP-connectors (Phrase, SharePoint, Teams); contentgroep + termbase, "
-        "alle talen, 0 AIU's."
+        "Kwaliteitscheck direct na elke Phrase-voorvertaling: langlopende "
+        "poller (webhook-log via Phrase-API, ~60 sec), draait on behalf of de "
+        "triggerende gebruiker, volledig via MCP-connectors (Phrase, "
+        "SharePoint, Teams); contentgroep + termbase, alle talen, 0 AIU's."
     ),
     on_behalf_of=True,
 )
@@ -689,6 +716,8 @@ class PhraseQaVoorvertalingWorkflow:
                     "eventUid": eventUid,
                 }
             )
+        if payload.get("poll_loop"):
+            return await self._poll_loop(payload)
         if payload.get("poll"):
             lookback = int(payload.get("lookback_minutes") or 8)
             candidates = await qa_poll_events(lookback)
@@ -724,6 +753,63 @@ class PhraseQaVoorvertalingWorkflow:
                 return "poll: niets nieuws te verwerken"
             return "poll: " + " | ".join(summaries)
         return await self._process_one(payload)
+
+    async def _poll_loop(self, payload: dict) -> str:
+        """Langlopende near-realtime poller: elke interval de nieuwste
+        JOB_STATUS_CHANGED-leveringen ophalen en direct verwerken.
+        Draait onder de triggerende gebruiker (OBO). Continue-as-new houdt
+        de execution oneindig draaiende zonder history-limiet."""
+        lookback = int(payload.get("lookback_minutes") or 3)
+        interval = int(payload.get("interval_seconds") or 60)
+        max_iterations = int(payload.get("max_iterations") or 500)
+        iterations = 0
+        processed = 0
+        while True:
+            candidates = []
+            try:
+                candidates = await qa_poll_events(lookback)
+            except Exception:
+                candidates = []
+            if candidates:
+                state = await qa_load_state()
+                done_events = set(state.get("processedEvents") or [])
+                done_parts = set(state.get("processedParts") or [])
+                for cand in candidates:
+                    ev = cand.get("eventUid")
+                    if ev and ev in done_events:
+                        continue
+                    pl = cand["payload"]
+                    parts = [p for p in pl.get("jobParts", []) if p.get("uid") not in done_parts]
+                    if not parts:
+                        continue
+                    pl = dict(pl, jobParts=parts)
+                    if ev:
+                        done_events.add(ev)
+                    for p in parts:
+                        done_parts.add(p.get("uid"))
+                    processed += 1
+                    try:
+                        await self._process_one(pl)
+                    except Exception:
+                        pass
+                    # houd de lijsten begrensd
+                    if len(done_events) > 2000:
+                        done_events = set(sorted(done_events)[-1000:])
+                    if len(done_parts) > 4000:
+                        done_parts = set(sorted(done_parts)[-2000:])
+                    state["processedEvents"] = sorted(done_events)
+                    state["processedParts"] = sorted(done_parts)
+                    await qa_save_state(state)
+            iterations += 1
+            if (
+                workflows.workflow.should_continue_as_new()
+                or iterations >= max_iterations
+            ):
+                workflows.workflow.continue_as_new(
+                    PollerState(event=dict(payload, poll_loop=True))
+                )
+                return f"poll-loop: {processed} events verwerkt in {iterations} iteraties; continue-as-new"
+            await qa_sleep(interval)
 
     async def _process_one(self, payload: dict) -> str:
         if not is_relevant_event(payload):
