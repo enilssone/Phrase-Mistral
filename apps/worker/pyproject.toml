@@ -8,9 +8,9 @@ version = "0.2.0"
 description = "Mistral Workflows worker: Phrase TMS events -> Teams + realtime kwaliteitscheck na voorvertaling"
 requires-python = ">=3.11"
 dependencies = [
-    "mistralai-workflows>=3.10",
-    "mistralai-workflows-plugins-mistralai",
-    "mistralai-workflows-plugins-triggers",
+    "mistralai-workflows>=3.19,<4",
+    "mistralai-workflows-plugins-mistralai>=3.20,<4",
+    "mistralai-workflows-plugins-triggers>=0.2,<0.3",
     "pydantic>=2",
     "httpx",
     "openpyxl",
