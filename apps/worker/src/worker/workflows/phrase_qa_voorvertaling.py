@@ -1,4 +1,4 @@
-"""Realtime kwaliteitscheck direct na Phrase-voorvertaling (Taalcentrum-VU).
+"""Kwaliteitscheck direct na Phrase-voorvertaling (Taalcentrum-VU).
 
 Volledig via MCP-connectors (geen losse API-token):
 - phrase_mistral_768b: Phrase TMS lezen en schrijven (tms_read_api,
@@ -6,11 +6,18 @@ Volledig via MCP-connectors (geen losse API-token):
 - sharepoint_mcp: Excel-overzicht opslaan in de map "Mistral QA voorvertaling".
 - teams: melding in het kanaal "Phrase updates".
 
-Getriggerd door de Phrase-event-webhook bij JOB_STATUS_CHANGED / COMPLETED
-op workflow level 1 (voorvertaling PLAI / MT-profiel). Alleen als het project
-een contentgroep EN termbase heeft: terminologie + stijlregels (en-GB, UT)
-toetsen, correcties terug naar Phrase (saveToTransMemory=Confirmed, geen
-setCompleted, 0 AIU's), Excel naar SharePoint, melding in Teams.
+Phrase-webhooks kunnen niet rechtstreeks bij Mistral-webhooks komen (Mistral
+vereist een HMAC-handtekening, Phrase stuurt die niet). Daarom draait deze
+workflow op een Mistral-schema (elke 5 min): hij leest via de Phrase-API
+(/webhooksCalls) welke JOB_STATUS_CHANGED-events sinds de vorige run zijn
+binnengekomen, filtert op COMPLETED op workflow level 1, onthoudt verwerkte
+events in een statusbestand in SharePoint en voert per event de
+kwaliteitscheck uit. Alleen als het project een contentgroep EN een termbase
+heeft: terminologie + stijlregels toetsen, correcties terug naar Phrase
+(saveToTransMemory=Confirmed, geen setCompleted, 0 AIU's), Excel naar
+SharePoint, melding met @owner in Teams.
+
+De workflow accepteert óók een enkel event-body (dict) voor handmatige tests.
 """
 
 import base64
@@ -44,6 +51,13 @@ TEAMS_TEAM_ID = os.environ.get(
 TEAMS_CHANNEL_ID = os.environ.get(
     "TEAMS_CHANNEL_ID", "19:f12365030ece4194a88701a4efcb7b0b@thread.tacv2"
 )
+PHRASE_WEBHOOK_UID = os.environ.get(
+    "PHRASE_WEBHOOK_UID", "9c07dcca-a480-4a3d-938c-baea3e24e161"
+)
+POLL_STATE_ITEM_ID = os.environ.get(
+    "POLL_STATE_ITEM_ID", "013PVE4AJ3M462ISRXKFGYWX55YDOPQPCV"
+)
+POLL_STATE_FILENAME = "qa-poller-state.json"
 
 
 def _unwrap(resp: Any) -> Any:
@@ -159,9 +173,144 @@ def apply_fixes(text: str, preferred_terms: list[str], target_lang: str) -> tupl
 
 
 @workflows.activity(name="qa-filter-event")
-async def qa_filter_event(event: TriggerEvent) -> dict:
-    body = event.body
-    return body if isinstance(body, dict) else {}
+async def qa_filter_event(event: Any) -> dict:
+    """Accepteert een TriggerEvent (webhook) of een gewone dict (schema/input)."""
+    if isinstance(event, dict):
+        return event
+    body = getattr(event, "body", None)
+    if isinstance(body, dict):
+        return body
+    return {}
+
+
+def _parse_created_at(value: Any):
+    """Parse '2026-11-27T12:40:11+0000' naar een bewuste datetime."""
+    from datetime import datetime
+
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("+0000", "+00:00"))
+    except Exception:
+        return None
+
+
+@workflows.activity(name="qa-poll-events")
+async def qa_poll_events(
+    lookback_minutes: int,
+    phrase: ToolCallClient = Depends(phrase_connector),
+) -> list:
+    """Leest recente JOB_STATUS_CHANGED-leveringen via de Phrase-API."""
+    from datetime import datetime, timedelta, timezone
+
+    resp = _unwrap(await phrase.call_tool(
+        tool_name="tms_read_api",
+        arguments={
+            "method": "GET",
+            "path": "/api2/v1/webhooksCalls",
+            "query_params": {
+                "webhookUid": PHRASE_WEBHOOK_UID,
+                "events": "JOB_STATUS_CHANGED",
+                "pageSize": "50",
+            },
+        },
+    ))
+    content: list = []
+    if isinstance(resp, dict):
+        content = resp.get("content") or (resp.get("response") or {}).get("content") or []
+    elif isinstance(resp, list):
+        content = resp
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=int(lookback_minutes or 8))
+    candidates: list[dict] = []
+    for call in content:
+        if not isinstance(call, dict) or call.get("forced"):
+            continue
+        created = _parse_created_at(call.get("createdAt"))
+        if not created or created < cutoff:
+            continue
+        try:
+            import json
+            body = json.loads(call.get("body") or "{}")
+        except Exception:
+            continue
+        if not isinstance(body, dict) or body.get("event") != "JOB_STATUS_CHANGED":
+            continue
+        parts = [
+            p for p in (body.get("jobParts") or [])
+            if isinstance(p, dict)
+            and p.get("status") == "COMPLETED"
+            and int(p.get("workflowLevel") or 1) == 1
+        ]
+        if not parts:
+            continue
+        meta = ((body.get("metadata") or {}).get("project") or {})
+        project_uid = meta.get("uid") or ((parts[0].get("project") or {}).get("uid"))
+        if not project_uid:
+            continue
+        candidates.append({
+            "eventUid": body.get("eventUid") or call.get("uid"),
+            "payload": {
+                "event": "JOB_STATUS_CHANGED",
+                "project": {"uid": project_uid, "name": meta.get("name") or ""},
+                "jobParts": parts,
+            },
+        })
+    return candidates
+
+
+@workflows.activity(name="qa-load-state")
+async def qa_load_state(
+    sp: ToolCallClient = Depends(sharepoint_connector),
+) -> dict:
+    """Statusbestand (verwerkte events/jobparts) uit SharePoint lezen."""
+    import json
+
+    resp = _unwrap(await sp.call_tool(
+        tool_name="read_binary_file",
+        arguments={"drive_id": SHAREPOINT_DRIVE_ID, "item_id": POLL_STATE_ITEM_ID},
+    ))
+    file_path = None
+    if isinstance(resp, dict):
+        file_path = resp.get("file_path") or resp.get("file_name")
+    if not file_path or not os.path.exists(file_path):
+        return {"processedEvents": [], "processedParts": []}
+    try:
+        with open(file_path, "r") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {"processedEvents": [], "processedParts": []}
+
+
+@workflows.activity(name="qa-save-state")
+async def qa_save_state(
+    state: dict,
+    sp: ToolCallClient = Depends(sharepoint_connector),
+) -> str:
+    """Statusbestand (verwerkte events/jobparts) in SharePoint overschrijven."""
+    import json
+
+    state["processedEvents"] = (state.get("processedEvents") or [])[-500:]
+    state["processedParts"] = (state.get("processedParts") or [])[-2000:]
+    local = "/tmp/qa-poller-state.json"
+    with open(local, "w") as fh:
+        json.dump(state, fh)
+    with open(local, "rb") as fh:
+        b64 = base64.b64encode(fh.read()).decode()
+    resp = await sp.call_tool(
+        tool_name="create_binary_file",
+        arguments={
+            "drive_id": SHAREPOINT_DRIVE_ID,
+            "folder_id": SHAREPOINT_FOLDER_ID,
+            "filename": POLL_STATE_FILENAME,
+            "base64_content": b64,
+        },
+    )
+    return str(resp)
 
 
 @workflows.activity(name="qa-fetch-project-info")
@@ -213,7 +362,7 @@ async def qa_fetch_project_info(
                     "method": "GET",
                     "path": f"/api2/v1/termBases/{tb_uid}/terms",
                     "query_params": {"pageSize": 500},
-                },
+                }
             ))
             if isinstance(t, dict):
                 raw_terms.extend(t.get("terms") or t.get("content") or [])
@@ -506,16 +655,53 @@ async def qa_notify_teams(
     name="phrase-qa-voorvertaling",
     workflow_display_name="Kwaliteitscheck na voorvertaling",
     workflow_description=(
-        "Realtime kwaliteitscheck direct na elke Phrase-voorvertaling, "
-        "volledig via MCP-connectors (Phrase, SharePoint, Teams); "
-        "contentgroep + termbase, alle talen, 0 AIU's."
+        "Kwaliteitscheck direct na elke Phrase-voorvertaling via 5-minuten-polling "
+        "op Phrase-webhook-events (COMPLETED, level 1), volledig via MCP-connectors "
+        "(Phrase, SharePoint, Teams); contentgroep + termbase, alle talen, 0 AIU's."
     ),
 )
 @uses_connectors(phrase_connector, teams_connector, sharepoint_connector)
 class PhraseQaVoorvertalingWorkflow:
     @workflows.workflow.entrypoint
-    async def run(self, event: TriggerEvent) -> str:
+    async def run(self, event: Any) -> str:
         payload = await qa_filter_event(event)
+        if payload.get("poll"):
+            lookback = int(payload.get("lookback_minutes") or 8)
+            candidates = await qa_poll_events(lookback)
+            if not candidates:
+                return "poll: geen nieuwe COMPLETED-voorvertalingen"
+            state = await qa_load_state()
+            done_events = set(state.get("processedEvents") or [])
+            done_parts = set(state.get("processedParts") or [])
+            summaries: list[str] = []
+            changed = False
+            for cand in candidates:
+                ev = cand.get("eventUid")
+                if ev and ev in done_events:
+                    continue
+                pl = cand["payload"]
+                parts = [p for p in pl.get("jobParts", []) if p.get("uid") not in done_parts]
+                if not parts:
+                    continue
+                pl = dict(pl, jobParts=parts)
+                if ev:
+                    done_events.add(ev)
+                for p in parts:
+                    done_parts.add(p.get("uid"))
+                changed = True
+                try:
+                    summaries.append(await self._process_one(pl))
+                except Exception as exc:
+                    summaries.append(f"fout bij verwerken: {exc}")
+                state["processedEvents"] = sorted(done_events)
+                state["processedParts"] = sorted(done_parts)
+                await qa_save_state(state)
+            if not changed:
+                return "poll: niets nieuws te verwerken"
+            return "poll: " + " | ".join(summaries)
+        return await self._process_one(payload)
+
+    async def _process_one(self, payload: dict) -> str:
         if not is_relevant_event(payload):
             return "genegeerd: geen COMPLETED-voorvertaling"
         info = await qa_fetch_project_info(payload)
