@@ -466,7 +466,7 @@ async def qa_notify_teams(
         content = f"@{owner_name} " + content
         try:
             members = _unwrap(await teams.call_tool(
-                tool_name="teams_list_team_members",
+                tool_name="teams.list_team_members",
                 arguments={"team_id": TEAMS_TEAM_ID, "query": owner_email or owner_name},
             ))
             candidates = members if isinstance(members, list) else ((members or {}).get("members") or (members or {}).get("content") or [])
@@ -496,7 +496,7 @@ async def qa_notify_teams(
     if mentions:
         args["mentions"] = mentions
     resp = await teams.call_tool(
-        tool_name="teams_post_channel_message",
+        tool_name="teams.post_channel_message",
         arguments=args,
     )
     return str(resp)
