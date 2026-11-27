@@ -1122,7 +1122,12 @@ class PhraseQaVoorvertalingWorkflow:
         # Lege input = gelevering van de Phrase-webhook naar de execute-API
         # (de body wordt daar gestript). Doe dan een korte catch-up-poll zodat
         # het event zelf binnen enkele seconden wordt opgepikt.
-        if not payload.get("jobParts") and not payload.get("event") and not payload.get("poll"):
+        if (
+            not payload.get("jobParts")
+            and not payload.get("event")
+            and not payload.get("poll")
+            and not payload.get("poll_loop")
+        ):
             payload = {"poll": True, "lookback_minutes": 3}
         if payload.get("poll_loop"):
             return await self._poll_loop(payload)
