@@ -4,7 +4,8 @@ Volledig via MCP-connectors (geen losse API-token):
 - phrase_mistral_768b: Phrase TMS lezen en schrijven (tms_read_api,
   tms_write_api, request_upload_url).
 - sharepoint_mcp: Excel-overzicht opslaan in de map "Mistral QA voorvertaling".
-- teams: melding in het kanaal "Phrase updates".
+- teams: melding in het kanaal "Phrase updates" + persoonlijke chat naar de
+  project owner.
 
 Phrase-webhooks kunnen niet rechtstreeks bij Mistral-webhooks komen (Mistral
 vereist een HMAC-handtekening, Phrase stuurt die niet). Daarom stuurt de
@@ -19,6 +20,11 @@ terminologie + stijlregels toetsen, correcties terug naar Phrase
 SharePoint, melding met @owner in Teams.
 
 De workflow accepteert óók een enkel event-body (dict) voor handmatige tests.
+
+Stijlgids (Else, 27-11-2026): vaste regels per domein/contenttype, zie
+STYLE_GUIDE_* hieronder. Per projectdomein wordt de bijbehorende sectie van
+de gids via de LLM-stijlcheck (mistral-small-latest) op de doelsegmenten
+getoetst. Regels aanpassen? Dan hieronder editen, pushen en herdeployen.
 """
 
 import base64
@@ -42,15 +48,164 @@ phrase_connector = connector("phrase_mistral_768b", run_as="auto")
 teams_connector = connector("teams", run_as="auto")
 sharepoint_connector = connector("sharepoint_mcp", run_as="auto")
 
-# Domein-afhankelijke stijlregels (Else, 27-11-2026). Key = Phrase-domeinnaam
-# (lowercase). "regex" = deterministische vervangingen; "llm" = stijlregels die
-# via de Mistral-LLM-stijlcheck (mistral-small-latest, 0 AIU's in Phrase) op de
-# doelsegmenten worden getest.
+# ---------------------------------------------------------------------------
+# Stijlgids Taalcentrum-VU (vast in de code; aanpasbaar door Else)
+# ---------------------------------------------------------------------------
+
+STYLE_GUIDE_GENERAL = (
+    "Bewaar de betekenis exact; voeg niets toe, laat niets weg en verzin niets. "
+    "Volg terminologie, termbases en stijlgidsen met hoogste prioriteit. "
+    "Houd tags, placeholders, variabelen, markup, links, maten, datums en "
+    "productnamen intact. Gebruik consistente terminologie. "
+    "De toon moet passen bij contenttype en domein. "
+    "Hiërarchie bij conflicten: projectinstructies > contenttyperegels > "
+    "domeinregels > algemene stijlregels."
+)
+
+STYLE_GUIDE_ENGLISH = (
+    "Engels is standaard British English (organisatie-spelling: organisation, "
+    "colour, analyse, travelled, programme behalvez software-context). "
+    "Geen Oxford comma: geen komma voor 'and'/'or' in een opsomming, tenzij "
+    "dat verwarring voorkomt. Projectinstellingen gaan voor."
+)
+
+STYLE_GUIDE_CONTENT_TYPES: dict[str, str] = {
+    "EDUCATION": (
+        "Doelgroep: leerlingen, studiekiezers, ouders, docenten en academisch "
+        "personeel. Gebruik heldere, toegankelijke taal en korte zinnen; "
+        "vermijd onnodig jargon. Adresleerlingen en studiekiezers direct met "
+        "een informele 'jij'-vorm ('you' in het Engels) waar passend. Leg "
+        "gespecialiseerde concepten uit in gewone taal. Klink behulpzaam, "
+        "aanmoedigend en informatief; vermijd corporatieve of bureaucratische "
+        "taal. Toon: behulpzaam, toegankelijk, educatief en betrouwbaar."
+    ),
+    "MARKETING": (
+        "Focus op duidelijkheid, voordelen en betrokkenheid. Gebruik "
+        "overtuigende maar geloofwaardige taal; houd zinnen kort en energiek. "
+        "Bewerk slogans natuurlijk in plaats van letterlijk. Benadruk waarde, "
+        "resultaten en gebruikersvoordelen. Geen overdreven claims die niet in "
+        "de bron staan. Behoud merkstem en consistentie. Toon: zelfverzekerd, "
+        "boeiend en klantgericht."
+    ),
+    "LEGAL": (
+        "Bewaar de juridische betekenis exact; vereenvoudig nooit als dat de "
+        "rechtsbedoeling kan wijzigen. Gebruik gevestigde juridische "
+        "terminologie en een formele register; interpreteer, parafraseer of "
+        "vat niet samen. Behoud contractuele, regelgevende en compliance-taal. "
+        "Toon: formeel, precies, objectief en gezaghebbend."
+    ),
+    "MEDICAL": (
+        "Prioriteit: nauwkeurigheid en patiëntveiligheid. Gebruik erkende "
+        "medische terminologie passend bij de doelgroep: voor "
+        "patiëntgerichte content heldere gewone taal, voor zorgprofessionals "
+        "professionele terminologie. Voeg geen dubbelzinnigheid toe; wees "
+        "consistent in medische termen, behandelingen, aandoeningen en "
+        "doseringen. Toon: professioneel, nauwkeurig en betrouwbaar."
+    ),
+    "SOCIAL MEDIA": (
+        "Optimaliseer voor leesbaarheid en betrokkenheid. Gebruik natuurlijke, "
+        "conversatietaal en pas cultureel aan waar passend. Houd berichten "
+        "beknopt en scanbaar. Behoud hashtags, handles, emoji's en "
+        "campagneverwijzingen tenzij anders gevraagd. Betrokkenheid gaat boven "
+        "letterlijke woordkeuze. Toon: vriendelijk, natuurlijk, "
+        "doelgroepgericht."
+    ),
+}
+
+STYLE_GUIDE_DOMAINS: dict[str, str] = {
+    "Higher Education": (
+        "Gebruik studentgericht taalgebruik; benadruk duidelijkheid en "
+        "toegankelijkheid; leg academische processen natuurlijk uit; vermijd "
+        "intern institutioneel jargon waar mogelijk."
+    ),
+    "Healthcare": (
+        "Prioriteer patiëntbegrip en -veiligheid; gebruik erkende "
+        "zorgterminologie; vermijd onnodige technische complexiteit voor "
+        "publiekspubliek."
+    ),
+    "Government / Public Sector": (
+        "Gebruik heldere, inclusieve en neutrale taal; prioriteer "
+        "transparantie en toegankelijkheid; vermijd promotionele bewoordingen."
+    ),
+    "Technology": (
+        "Gebruik standaard industrieterminologie; behoud technische precisie; "
+        "vertaal gangbare product- en technologienamen niet tenzij vereist."
+    ),
+    "Finance": (
+        "Gebruik precieze financiële terminologie; bewaar numerieke "
+        "nauwkeurigheid; houd een professionele, compliant toon."
+    ),
+    "NGO / Non-profit": (
+        "Gebruik mensgerichte taal; benadruk impact, community en "
+        "toegankelijkheid; blijf oprecht en feitelijk; vermijd onnodige "
+        "marketingtaal."
+    ),
+}
+
+# Koppeling Phrase-domeinnaam (lowercase) -> (contenttypes, domeinsecties).
+# Meerdere aliassen per regel zijn toegestaan; eerste match wint.
+STYLE_GUIDE_MAP: list[tuple[str, list[str], list[str]]] = [
+    ("education", ["EDUCATION"], ["Higher Education"]),
+    ("educatie", ["EDUCATION"], ["Higher Education"]),
+    ("higher education", ["EDUCATION"], ["Higher Education"]),
+    ("ho", ["EDUCATION"], ["Higher Education"]),
+    ("wo", ["EDUCATION"], ["Higher Education"]),
+    ("marketing", ["MARKETING"], []),
+    ("advertising", ["MARKETING"], []),
+    ("reclame", ["MARKETING"], []),
+    ("legal", ["LEGAL"], []),
+    ("juridisch", ["LEGAL"], []),
+    ("law", ["LEGAL"], []),
+    ("medical", ["MEDICAL"], ["Healthcare"]),
+    ("medisch", ["MEDICAL"], ["Healthcare"]),
+    ("healthcare", ["MEDICAL"], ["Healthcare"]),
+    ("life sciences", ["MEDICAL"], ["Healthcare"]),
+    ("social media", ["SOCIAL MEDIA"], []),
+    ("government", [], ["Government / Public Sector"]),
+    ("public sector", [], ["Government / Public Sector"]),
+    ("overheid", [], ["Government / Public Sector"]),
+    ("technology", [], ["Technology"]),
+    ("it", [], ["Technology"]),
+    ("tech", [], ["Technology"]),
+    ("finance", [], ["Finance"]),
+    ("financial", [], ["Finance"]),
+    ("financieel", [], ["Finance"]),
+    ("ngo", [], ["NGO / Non-profit"]),
+    ("non-profit", [], ["NGO / Non-profit"]),
+    ("nonprofit", [], ["NGO / Non-profit"]),
+]
+
+
+def style_sections_for(domain: str, sub_domain: str = "") -> list[tuple[str, str]]:
+    """Bijbehorende stijlgids-secties bij domein/subdomein, als (label, tekst)."""
+    sections: list[tuple[str, str]] = []
+    for key in (domain, sub_domain):
+        if not isinstance(key, str) or not key.strip():
+            continue
+        k = key.strip().lower()
+        for name, ctypes, doms in STYLE_GUIDE_MAP:
+            if name == k or k in name or name in k:
+                for ct in ctypes:
+                    text = STYLE_GUIDE_CONTENT_TYPES.get(ct)
+                    if text:
+                        sections.append((f"contenttype {ct}", text))
+                for d in doms:
+                    text = STYLE_GUIDE_DOMAINS.get(d)
+                    if text:
+                        sections.append((f"domein {d}", text))
+                break
+    return sections
+
+
+# ---------------------------------------------------------------------------
+# Klantspecifieke domeinregels (regex = deterministisch, llm = via LLM-check)
+# ---------------------------------------------------------------------------
+
 DOMAIN_STYLE_RULES: dict[str, dict] = {
     "planet optik": {
         "regex": [
             {
-                "pattern": r"SWAROVSKI\s*[-\u2011]\s*OPTIK",
+                "pattern": r"SWAROVSKI\s*[-‑]OPTIK",
                 "replacement": "SWAROVSKI OPTIK",
                 "reason": "domeinstijl Planet Optik: geen koppelteken aan de merknaam",
             },
@@ -162,8 +317,8 @@ UT_RE_APOSTROPHE_PLURAL = re.compile(r"\b(\d{4})'s\b")
 UT_RE_ABBR_DOTS = re.compile(r"\b(U\.T\.|Ph\.D\.)\b")
 
 
-def _is_en_gb(target_lang: str) -> bool:
-    return "en_gb" in (target_lang or "").lower() or (target_lang or "").lower() == "en-gb"
+def _is_english(target_lang: str) -> bool:
+    return (target_lang or "").lower().replace("_", "-").startswith("en")
 
 
 def extract_preferred_terms(terms: list) -> list[str]:
@@ -211,7 +366,7 @@ def apply_fixes(
             out = pattern.sub(term, out)
             reasons.append(f"terminologie: '{m.group(0)}' -> '{term}'")
 
-    if _is_en_gb(target_lang):
+    if _is_english(target_lang):
         for us, gb in EN_GB_PAIRS:
             pattern = re.compile(r"\b" + us + r"\b", re.IGNORECASE)
             m = pattern.search(out)
@@ -522,7 +677,7 @@ async def qa_style_llm_check(
     project_name: str,
     llm_rules: list[str],
 ) -> list[dict]:
-    """Domein-stijlregels toetsen op doelsegmenten via mistral-small-latest.
+    """Stijlregels toetsen op doelsegmenten via mistral-small-latest.
     Retourneert correcties als lijst dicts {index, original, corrected, reason}."""
     import json
 
@@ -607,12 +762,24 @@ async def qa_check_job(
         or info.get("content_group_name") or "onbekend domein"
     )
     domain_regex = rules.get("regex") or []
-    llm_rules = rules.get("llm") or []
+    base_llm_rules = list(rules.get("llm") or [])
+
+    # Stijlgids-secties voor dit domein (vast in de code, zie STYLE_GUIDE_*).
+    guide_sections = style_sections_for(domain, info.get("sub_domain") or "")
+    for label, text in guide_sections:
+        base_llm_rules.append(f"{label}: {text}")
+    if guide_sections:
+        base_llm_rules.append(f"algemeen: {STYLE_GUIDE_GENERAL}")
 
     for part in completed:
         part_uid = part.get("uid")
         part_id = part_uid.get("uid") if isinstance(part_uid, dict) else part_uid
         target_lang = part.get("targetLang", "")
+        # Engelse doelen: British English + geen Oxford comma via de LLM-check;
+        # de deterministische en-GB-woorden worden al in apply_fixes gedaan.
+        llm_rules = list(base_llm_rules)
+        if _is_english(target_lang):
+            llm_rules.append(f"Engels: {STYLE_GUIDE_ENGLISH}")
         try:
             resp = _unwrap(await phrase.call_tool(
                 tool_name="tms_read_api",
@@ -649,8 +816,8 @@ async def qa_check_job(
 
             holder["xml"] = re.sub(r"<target>(.*?)</target>", _fix_target, xml, flags=re.S)
 
-            # Domein-afhankelijke stijlcheck via LLM (alleen als er llm-regels
-            # voor het domein zijn gedefinieerd), per batch van max 80 segmenten.
+            # Stijlcheck via LLM (domeinregels + stijlgids), per batch van
+            # max 80 segmenten.
             if llm_rules:
                 segs = re.findall(r"<target>(.*?)</target>", holder["xml"], flags=re.S)
                 unescaped = [
@@ -921,7 +1088,8 @@ async def qa_notify_owner(
         "Kwaliteitscheck direct na elke Phrase-voorvertaling: langlopende "
         "poller (webhook-log via Phrase-API, ~60 sec), draait on behalf of de "
         "triggerende gebruiker, volledig via MCP-connectors (Phrase, "
-        "SharePoint, Teams); contentgroep + termbase, alle talen, 0 AIU's."
+        "SharePoint, Teams); contentgroep + termbase, alle talen, 0 AIU's; "
+        "domein-afhankelijke stijlgids + persoonlijke Teams-melding owner."
     ),
     on_behalf_of=True,
 )
@@ -953,7 +1121,7 @@ class PhraseQaVoorvertalingWorkflow:
             )
         # Lege input = gelevering van de Phrase-webhook naar de execute-API
         # (de body wordt daar gestript). Doe dan een korte catch-up-poll zodat
-        # het event zelf binnen enkele seconden wordt opgepakt.
+        # het event zelf binnen enkele seconden wordt opgepikt.
         if not payload.get("jobParts") and not payload.get("event") and not payload.get("poll"):
             payload = {"poll": True, "lookback_minutes": 3}
         if payload.get("poll_loop"):
