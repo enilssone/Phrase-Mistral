@@ -27,9 +27,9 @@ from mistralai.workflows.plugins.mistralai.connectors import (
 )
 from mistralai.workflows.plugins.triggers import TriggerEvent
 
-phrase_connector = connector("phrase_mistral_768b", run_as="deployment")
-teams_connector = connector("teams", run_as="deployment")
-sharepoint_connector = connector("sharepoint_mcp", run_as="deployment")
+phrase_connector = connector("phrase_mistral_768b", run_as="auto")
+teams_connector = connector("teams", run_as="auto")
+sharepoint_connector = connector("sharepoint_mcp", run_as="auto")
 
 SHAREPOINT_DRIVE_ID = os.environ.get(
     "SHAREPOINT_DRIVE_ID",
@@ -225,6 +225,10 @@ async def qa_fetch_project_info(
         "project": {
             "uid": project_uid,
             "name": details.get("name") or project.get("name") or "?",
+        },
+        "owner": {
+            "email": ((details.get("owner") or {}).get("email")) or ((project.get("owner") or {}).get("email")) or "",
+            "display_name": " ".join(filter(None, [((details.get("owner") or {}).get("firstName") or ""), ((details.get("owner") or {}).get("lastName") or "")])).strip(),
         },
         "contentGroups": [g.get("id") for g in content_groups if isinstance(g, dict)],
         "termBases": [t.get("id") or t.get("uid") for t in term_bases],
@@ -442,31 +446,65 @@ async def qa_notify_teams(
     teams: ToolCallClient = Depends(teams_connector),
 ) -> str:
     p = report["project"]["name"]
+    owner = report.get("owner") or {}
+    owner_name = (owner.get("display_name") or "").strip()
+    owner_email = (owner.get("email") or "").strip()
     results = report.get("results", [])
     fixed = [r for r in results if r.get("uploaded")]
     clean = [r for r in results if r.get("clean")]
     reasons = sorted({reason for r in results for reason in r.get("reasons", [])})
+    content = (
+        f"Kwaliteitscheck direct na voorvertaling uitgevoerd voor **{p}**."
+        f"\n- Jobs gecontroleerd: {len(results)}"
+        f"\n- Jobs met correcties (teruggeschreven naar Phrase): {len(fixed)}"
+        f"\n- Jobs zonder bevindingen: {len(clean)}"
+        f"\n- Soorten bevindingen: {', '.join(reasons) if reasons else 'geen'}"
+        f"\n- Excel-overzicht: SharePoint > Vertalen intern > Phrase > Mistral QA voorvertaling."
+    )
+    mentions = None
+    if owner_name:
+        content = f"@{owner_name} " + content
+        try:
+            members = _unwrap(await teams.call_tool(
+                tool_name="teams_list_team_members",
+                arguments={"team_id": TEAMS_TEAM_ID, "query": owner_email or owner_name},
+            ))
+            candidates = members if isinstance(members, list) else ((members or {}).get("members") or (members or {}).get("content") or [])
+            member = None
+            for m in candidates:
+                if isinstance(m, dict) and owner_email and (m.get("email") or "").lower() == owner_email.lower():
+                    member = m
+                    break
+            if member is None:
+                for m in candidates:
+                    if isinstance(m, dict) and owner_name.lower() in ((m.get("display_name") or "")).lower():
+                        member = m
+                        break
+            if member and member.get("user_id"):
+                mentions = [{
+                    "user_id": member["user_id"],
+                    "display_name": member.get("display_name") or owner_name,
+                }]
+        except Exception:
+            mentions = None
+    args = {
+        "team_id": TEAMS_TEAM_ID,
+        "channel_id": TEAMS_CHANNEL_ID,
+        "subject": f"Kwaliteitscheck na voorvertaling: {p}",
+        "content": content,
+    }
+    if mentions:
+        args["mentions"] = mentions
     resp = await teams.call_tool(
         tool_name="teams_post_channel_message",
-        arguments={
-            "team_id": TEAMS_TEAM_ID,
-            "channel_id": TEAMS_CHANNEL_ID,
-            "subject": f"Kwaliteitscheck na voorvertaling: {p}",
-            "content": (
-                f"Kwaliteitscheck direct na voorvertaling uitgevoerd voor **{p}**."
-                f"\n- Jobs gecontroleerd: {len(results)}"
-                f"\n- Jobs met correcties (teruggeschreven naar Phrase): {len(fixed)}"
-                f"\n- Jobs zonder bevindingen: {len(clean)}"
-                f"\n- Soorten bevindingen: {', '.join(reasons) if reasons else 'geen'}"
-                f"\n- Excel-overzicht: SharePoint > Vertalen intern > Phrase > Mistral QA voorvertaling."
-            ),
-        },
+        arguments=args,
     )
     return str(resp)
 
 
 @workflows.workflow.define(
     name="phrase-qa-voorvertaling",
+    on_behalf_of=True,
     workflow_display_name="Kwaliteitscheck na voorvertaling",
     workflow_description=(
         "Realtime kwaliteitscheck direct na elke Phrase-voorvertaling, "
@@ -485,6 +523,7 @@ class PhraseQaVoorvertalingWorkflow:
         if not info.get("check"):
             return f"genegeerd: {info.get('reason')}"
         report = await qa_check_job(payload, info)
+        report["owner"] = info.get("owner") or {}
         filename = await qa_build_xlsx(report)
         await qa_upload_sharepoint(filename)
         return await qa_notify_teams(report)
