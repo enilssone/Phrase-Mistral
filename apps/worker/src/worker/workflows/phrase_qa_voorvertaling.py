@@ -666,10 +666,29 @@ async def qa_notify_teams(
 @uses_connectors(phrase_connector, teams_connector, sharepoint_connector)
 class PhraseQaVoorvertalingWorkflow:
     @workflows.workflow.entrypoint
-    async def run(self, event: Any = None) -> str:
-        if event is None:
-            return "geen input ontvangen"
-        payload = await qa_filter_event(event)
+    async def run(
+        self,
+        jobParts: Any = None,
+        metadata: Any = None,
+        event: Any = None,
+        timestamp: Any = None,
+        eventUid: Any = None,
+    ) -> str:
+        # Phrase-webhook v2 stuurt de event-body als raw JSON; de keys mapten
+        # direct op deze parameters. Handmatige/poll-aanroepen kunnen ook
+        # {"event": {...}} of de losse keys sturen.
+        if isinstance(event, dict) and not jobParts:
+            payload = await qa_filter_event(event)
+        else:
+            payload = await qa_filter_event(
+                {
+                    "jobParts": jobParts,
+                    "metadata": metadata,
+                    "event": event,
+                    "timestamp": timestamp,
+                    "eventUid": eventUid,
+                }
+            )
         if payload.get("poll"):
             lookback = int(payload.get("lookback_minutes") or 8)
             candidates = await qa_poll_events(lookback)
