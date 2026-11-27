@@ -504,7 +504,7 @@ async def qa_notify_teams(
 
 @workflows.workflow.define(
     name="phrase-qa-voorvertaling",
-    on_behalf_of=True,
+    ,
     workflow_display_name="Kwaliteitscheck na voorvertaling",
     workflow_description=(
         "Realtime kwaliteitscheck direct na elke Phrase-voorvertaling, "
