@@ -42,6 +42,36 @@ phrase_connector = connector("phrase_mistral_768b", run_as="auto")
 teams_connector = connector("teams", run_as="auto")
 sharepoint_connector = connector("sharepoint_mcp", run_as="auto")
 
+# Domein-afhankelijke stijlregels (Else, 27-11-2026). Key = Phrase-domeinnaam
+# (lowercase). "regex" = deterministische vervangingen; "llm" = stijlregels die
+# via de Mistral-LLM-stijlcheck (mistral-small-latest, 0 AIU's in Phrase) op de
+# doelsegmenten worden getest.
+DOMAIN_STYLE_RULES: dict[str, dict] = {
+    "planet optik": {
+        "regex": [
+            {
+                "pattern": r"SWAROVSKI\s*[-\u2011]\s*OPTIK",
+                "replacement": "SWAROVSKI OPTIK",
+                "reason": "domeinstijl Planet Optik: geen koppelteken aan de merknaam",
+            },
+        ],
+        "llm": [
+            "Gebruik de informele je-vorm (je/jouw/jullie), nooit u of U.",
+            "Schrijf de merknaam altijd zonder koppeltekens: SWAROVSKI OPTIK.",
+        ],
+    },
+}
+
+
+def domain_rules_for(*keys: Any) -> dict:
+    """Stijlregels horend bij domein/subdomein/klant/contentgroep (eerste match)."""
+    for key in keys:
+        if isinstance(key, str) and key.strip():
+            rules = DOMAIN_STYLE_RULES.get(key.strip().lower())
+            if rules:
+                return rules
+    return {}
+
 
 class PollerState(pydantic.BaseModel):
     """Carry-forward state voor continue-as-new van de poll-loop."""
@@ -155,9 +185,24 @@ def extract_preferred_terms(terms: list) -> list[str]:
     return [t for t in preferred if t]
 
 
-def apply_fixes(text: str, preferred_terms: list[str], target_lang: str) -> tuple[str, list[str]]:
+def apply_fixes(
+    text: str,
+    preferred_terms: list[str],
+    target_lang: str,
+    domain_rules: list | None = None,
+) -> tuple[str, list[str]]:
     reasons: list[str] = []
     out = text
+
+    for rule in domain_rules or []:
+        try:
+            pattern = re.compile(rule["pattern"])
+            m = pattern.search(out)
+            if m:
+                out = pattern.sub(rule["replacement"], out)
+                reasons.append(rule.get("reason") or "domeinstijl")
+        except Exception:
+            continue
 
     for term in preferred_terms:
         pattern = re.compile(r"\b" + re.escape(term) + r"\b", re.IGNORECASE)
@@ -403,6 +448,16 @@ async def qa_fetch_project_info(
             "uid": project_uid,
             "name": details.get("name") or project.get("name") or "?",
         },
+        "domain": (
+            ((details.get("domain") or {}).get("name"))
+            or (((payload.get("metadata") or {}).get("project") or {}).get("domain") or {}).get("name")
+            or ""
+        ),
+        "sub_domain": ((details.get("subDomain") or {}).get("name")) or "",
+        "client": ((details.get("client") or {}).get("name")) or "",
+        "content_group_name": (
+            content_groups[0].get("name") if content_groups else ""
+        ),
         "owner": {
             "email": ((details.get("owner") or {}).get("email")) or ((project.get("owner") or {}).get("email")) or "",
             "display_name": " ".join(filter(None, [((details.get("owner") or {}).get("firstName") or ""), ((details.get("owner") or {}).get("lastName") or "")])).strip(),
@@ -459,6 +514,70 @@ def _extract_text(value: Any) -> str | None:
     return None
 
 
+@workflows.activity(name="qa-style-llm-check", start_to_close_timeout=timedelta(minutes=5))
+async def qa_style_llm_check(
+    segments: list[str],
+    domain: str,
+    target_lang: str,
+    project_name: str,
+    llm_rules: list[str],
+) -> list[dict]:
+    """Domein-stijlregels toetsen op doelsegmenten via mistral-small-latest.
+    Retourneert correcties als lijst dicts {index, original, corrected, reason}."""
+    import json
+
+    from mistralai.client import models as mllm_models
+    from mistralai.workflows.plugins.mistralai.activities import (
+        mistralai_chat_complete,
+    )
+
+    if not segments or not llm_rules:
+        return []
+    prompt = (
+        f"Je bent taaleditor bij Taalcentrum-VU. Controleer onderstaande doelsegmenten "
+        f"(doeltaal {target_lang or 'onbekend'}) uit project '{project_name}' (domein: {domain}) "
+        f"uitsluitend op deze stijlregels:\n"
+        + "\n".join(f"- {r}" for r in llm_rules)
+        + "\n\nSegmenten:\n"
+        + "\n".join(f"{i}: {t}" for i, t in enumerate(segments))
+        + '\n\nAntwoord alleen met JSON: {"corrections":[{"index":<getal>,"original":"...","corrected":"...","reason":"..."}]}. '
+        "Neem alleen segmenten op die daadwerkelijk tegen de stijlregels ingaan; pas verder niets aan "
+        "en vertaal niets opnieuw."
+    )
+    try:
+        resp = await mistralai_chat_complete(
+            params=mllm_models.ChatCompletionRequest(
+                model="mistral-small-latest",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                response_format={"type": "json_object"},
+            ),
+        )
+        choices = getattr(resp, "choices", None)
+        msg = choices[0].message if choices else None
+        txt = getattr(msg, "content", None) or str(resp)
+        data = json.loads(txt) if isinstance(txt, str) else txt
+        raw = data.get("corrections") if isinstance(data, dict) else []
+        out: list[dict] = []
+        for c in raw or []:
+            try:
+                idx = int(c.get("index"))
+                if 0 <= idx < len(segments):
+                    corrected = str(c.get("corrected") or "").strip()
+                    if corrected and corrected != segments[idx]:
+                        out.append({
+                            "index": idx,
+                            "original": segments[idx],
+                            "corrected": corrected,
+                            "reason": str(c.get("reason") or "stijlregel"),
+                        })
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
 @workflows.activity(name="qa-check-job")
 async def qa_check_job(
     payload: dict,
@@ -476,6 +595,19 @@ async def qa_check_job(
     ]
     results: list[dict] = []
     terms = info.get("preferredTerms", [])
+    domain = info.get("domain") or ""
+    rules = domain_rules_for(
+        domain,
+        info.get("sub_domain"),
+        info.get("client"),
+        info.get("content_group_name"),
+    )
+    rules_label = (
+        domain or info.get("sub_domain") or info.get("client")
+        or info.get("content_group_name") or "onbekend domein"
+    )
+    domain_regex = rules.get("regex") or []
+    llm_rules = rules.get("llm") or []
 
     for part in completed:
         part_uid = part.get("uid")
@@ -508,7 +640,7 @@ async def qa_check_job(
             def _fix_target(m):
                 original = m.group(1)
                 unescaped = original.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-                fixed, reasons = apply_fixes(unescaped, terms, target_lang)
+                fixed, reasons = apply_fixes(unescaped, terms, target_lang, domain_regex)
                 if reasons:
                     part_reasons.extend(reasons)
                     re_escaped = fixed.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -516,6 +648,46 @@ async def qa_check_job(
                 return m.group(0)
 
             holder["xml"] = re.sub(r"<target>(.*?)</target>", _fix_target, xml, flags=re.S)
+
+            # Domein-afhankelijke stijlcheck via LLM (alleen als er llm-regels
+            # voor het domein zijn gedefinieerd), per batch van max 80 segmenten.
+            if llm_rules:
+                segs = re.findall(r"<target>(.*?)</target>", holder["xml"], flags=re.S)
+                unescaped = [
+                    s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+                    for s in segs
+                ]
+                corrections: dict[int, dict] = {}
+                for start in range(0, len(unescaped), 80):
+                    batch = unescaped[start : start + 80]
+                    corr = await qa_style_llm_check(
+                        batch, rules_label, target_lang, info["project"]["name"], llm_rules
+                    )
+                    for c in corr:
+                        corrections[start + c["index"]] = c
+                if corrections:
+                    counter = {"i": 0}
+
+                    def _fix_llm(m):
+                        i = counter["i"]
+                        counter["i"] += 1
+                        c = corrections.get(i)
+                        if c:
+                            part_reasons.append(
+                                f"stijl {rules_label}: {c['reason']}"
+                            )
+                            fixed = (
+                                c["corrected"]
+                                .replace("&", "&amp;")
+                                .replace("<", "&lt;")
+                                .replace(">", "&gt;")
+                            )
+                            return "<target>" + fixed + "</target>"
+                        return m.group(0)
+
+                    holder["xml"] = re.sub(
+                        r"<target>(.*?)</target>", _fix_llm, holder["xml"], flags=re.S
+                    )
 
             if not part_reasons:
                 results.append({
@@ -614,7 +786,7 @@ async def qa_upload_sharepoint(
             "base64_content": b64,
         },
     )
-    return str(resp)
+    return _extract_url(resp) or ""
 
 
 @workflows.activity(name="qa-notify-teams")
@@ -677,6 +849,69 @@ async def qa_notify_teams(
         arguments=args,
     )
     return str(resp)
+
+
+@workflows.activity(name="qa-notify-owner")
+async def qa_notify_owner(
+    report: dict,
+    teams: ToolCallClient = Depends(teams_connector),
+) -> str:
+    """Korte persoonlijke Teams-chat (1-op-1) naar de project owner."""
+    owner = report.get("owner") or {}
+    owner_email = (owner.get("email") or "").strip().lower()
+    owner_name = (owner.get("display_name") or "").strip()
+    if not owner_email:
+        return "geen owner-email; DM overgeslagen"
+    p = report["project"]["name"]
+    results = report.get("results", [])
+    fixed = [r for r in results if r.get("uploaded")]
+    clean = [r for r in results if r.get("clean")]
+    reasons = sorted({reason for r in results for reason in r.get("reasons", [])})
+    excel = report.get("excel") or {}
+    locatie = excel.get("url") or (
+        "SharePoint > Vertalen intern > Phrase > Mistral QA voorvertaling "
+        f"({excel.get('filename', 'Excel-overzicht')})"
+    )
+    content = (
+        f"Kwaliteitscheck na voorvertaling voor **{p}** is klaar."
+        f"\n- Jobs gecontroleerd: {len(results)}"
+        f"\n- Jobs met correcties (teruggeschreven naar Phrase): {len(fixed)}"
+        f"\n- Jobs zonder bevindingen: {len(clean)}"
+        f"\n- Soorten bevindingen: {', '.join(reasons) if reasons else 'geen'}"
+        f"\n- Excel-overzicht: {locatie}"
+    )
+    try:
+        chats = _unwrap(await teams.call_tool(
+            tool_name="list_chats",
+            arguments={"limit": 50},
+        ))
+        chat_list = chats.get("chats") if isinstance(chats, dict) else []
+        chat_id = None
+        for ch in chat_list or []:
+            members = ch.get("members") or []
+            emails = {(m.get("email") or "").lower() for m in members}
+            if ch.get("chat_type") == "oneOnOne" and owner_email in emails:
+                chat_id = ch.get("id")
+                break
+        if not chat_id:
+            return (
+                "geen bestaande 1-op-1 chat met owner "
+                f"({owner_name or owner_email}); DM overgeslagen"
+            )
+        resp = await teams.call_tool(
+            tool_name="post_chat_message",
+            arguments={
+                "chat_id": chat_id,
+                "content": content,
+                "_confirmationReason": (
+                    f"Persoonlijke melding van de kwaliteitscheck na voorvertaling "
+                    f"voor project {p} naar de project owner."
+                ),
+            },
+        )
+        return str(resp)
+    except Exception as exc:
+        return f"owner-DM mislukt: {exc}"
 
 
 @workflows.workflow.define(
@@ -828,5 +1063,8 @@ class PhraseQaVoorvertalingWorkflow:
         report = await qa_check_job(payload, info)
         report["owner"] = info.get("owner") or {}
         filename = await qa_build_xlsx(report)
-        await qa_upload_sharepoint(filename)
-        return await qa_notify_teams(report)
+        excel_url = await qa_upload_sharepoint(filename)
+        report["excel"] = {"filename": filename, "url": excel_url}
+        channel = await qa_notify_teams(report)
+        owner_dm = await qa_notify_owner(report)
+        return f"{channel} | owner-DM: {owner_dm}"
