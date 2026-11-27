@@ -7,13 +7,14 @@ Volledig via MCP-connectors (geen losse API-token):
 - teams: melding in het kanaal "Phrase updates".
 
 Phrase-webhooks kunnen niet rechtstreeks bij Mistral-webhooks komen (Mistral
-vereist een HMAC-handtekening, Phrase stuurt die niet). Daarom draait deze
-workflow op een Mistral-schema (elke 5 min): hij leest via de Phrase-API
-(/webhooksCalls) welke JOB_STATUS_CHANGED-events sinds de vorige run zijn
-binnengekomen, filtert op COMPLETED op workflow level 1, onthoudt verwerkte
-events in een statusbestand in SharePoint en voert per event de
-kwaliteitscheck uit. Alleen als het project een contentgroep EN een termbase
-heeft: terminologie + stijlregels toetsen, correcties terug naar Phrase
+vereist een HMAC-handtekening, Phrase stuurt die niet). Daarom stuurt de
+Phrase-webhook (v2, secretTokenType=AUTHORIZATION, secretToken
+"Bearer <Mistral-API-key>") de event-body rechtstreeks naar
+POST /v1/workflows/phrase-qa-voorvertaling/execute. De workflow draait dan
+on_behalf_of de triggerende user (Else), dus met de user-connectors
+(Phrase, SharePoint, Teams). In de run: filter op COMPLETED op workflow
+level 1; alleen als het project een contentgroep EN een termbase heeft:
+terminologie + stijlregels toetsen, correcties terug naar Phrase
 (saveToTransMemory=Confirmed, geen setCompleted, 0 AIU's), Excel naar
 SharePoint, melding met @owner in Teams.
 
@@ -655,15 +656,19 @@ async def qa_notify_teams(
     name="phrase-qa-voorvertaling",
     workflow_display_name="Kwaliteitscheck na voorvertaling",
     workflow_description=(
-        "Kwaliteitscheck direct na elke Phrase-voorvertaling via 5-minuten-polling "
-        "op Phrase-webhook-events (COMPLETED, level 1), volledig via MCP-connectors "
-        "(Phrase, SharePoint, Teams); contentgroep + termbase, alle talen, 0 AIU's."
+        "Kwaliteitscheck direct na elke Phrase-voorvertaling: realtime via de "
+        "Phrase-webhook (JOB_STATUS_CHANGED, COMPLETED, level 1), volledig via "
+        "MCP-connectors (Phrase, SharePoint, Teams); contentgroep + termbase, "
+        "alle talen, 0 AIU's."
     ),
+    on_behalf_of=True,
 )
 @uses_connectors(phrase_connector, teams_connector, sharepoint_connector)
 class PhraseQaVoorvertalingWorkflow:
     @workflows.workflow.entrypoint
-    async def run(self, event: Any) -> str:
+    async def run(self, event: Any = None) -> str:
+        if event is None:
+            return "geen input ontvangen"
         payload = await qa_filter_event(event)
         if payload.get("poll"):
             lookback = int(payload.get("lookback_minutes") or 8)
